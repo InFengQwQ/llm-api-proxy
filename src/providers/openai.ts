@@ -3,8 +3,8 @@ import type {
   ChatCompletionResponse,
   StreamChunk,
   ProviderHealth,
-} from '../../types/api.js';
-import type { ProviderConfig } from '../../config/index.js';
+} from '../types/api.js';
+import type { ProviderConfig } from '../config/index.js';
 import type { ProviderAdapter, RequestContext } from './base.js';
 
 export class OpenAIAdapter implements ProviderAdapter {

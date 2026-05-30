@@ -19,6 +19,11 @@ function resolveEnvVars(obj: unknown): unknown {
   return obj;
 }
 
+export interface CircuitBreakerConfig {
+  failure_threshold: number; // 连续失败多少次后打开断路器
+  recovery_timeout: number; // 秒，恢复探测间隔
+}
+
 const RateLimitSchema = z.object({
   rpm: z.number().optional(),
   tpm: z.number().optional(),
@@ -40,6 +45,13 @@ const ProviderSchema = z.object({
   rate_limit: RateLimitSchema.optional(),
 });
 
+const AutoRoutingGroupSchema = z.object({
+  /** 候选列表，格式同 model 字段，支持 <provider>/<model> */
+  targets: z.array(z.string()).min(1),
+  /** 熔断恢复前连续失败 N 次后暂时跳过该 target（默认 3） */
+  failure_threshold: z.number().min(1).default(3),
+});
+
 const ConfigSchema = z.object({
   server: z.object({
     host: z.string().default('0.0.0.0'),
@@ -51,10 +63,15 @@ const ConfigSchema = z.object({
     path: z.string().default('./data/gateway.db'),
   }),
   rate_limits: RateLimitSchema.optional(),
+  /** auto 路由组，调用方使用 model="auto:<group>" 触发 */
+  auto_routing: z.record(AutoRoutingGroupSchema).optional(),
 });
+
+export type AutoRoutingGroup = z.infer<typeof AutoRoutingGroupSchema>;
 
 export type Config = z.infer<typeof ConfigSchema>;
 export type ProviderConfig = Config['providers'][number];
+export type AutoRoutingConfig = NonNullable<Config['auto_routing']>;
 
 let configInstance: Config | null = null;
 

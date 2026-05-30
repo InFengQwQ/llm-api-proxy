@@ -73,7 +73,15 @@ export interface StreamChunk {
   model: string;
   choices: Array<{
     index: number;
-    delta: Partial<ChatMessage> & { role?: 'assistant' };
+    delta: {
+      role?: 'assistant';
+      content?: string | null;
+      tool_calls?: Array<{
+        index: number;
+        id?: string;
+        function?: { name?: string; arguments?: string };
+      }>;
+    };
     finish_reason?: 'stop' | 'length' | 'content_filter' | 'tool_calls';
   }>;
   usage?: {
@@ -132,6 +140,14 @@ export interface ModelInfo {
   created: number;
   owned_by: string;
   provider: string; // 配置中的 provider 别名
-  provider_type: string; // openai / anthropic / ollama / deepseek
+  provider_type: string; // openai / anthropic / ollama / gemini
   model_id: string; // provider 端的实际模型名
+}
+
+// Provider 健康状态
+export interface ProviderHealth {
+  provider: string;
+  status: 'healthy' | 'degraded' | 'unavailable';
+  latency_ms: number;
+  error_rate: number;
 }

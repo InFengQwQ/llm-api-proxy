@@ -3,12 +3,13 @@ import type { ProviderAdapter } from './base.js';
 import { OpenAIAdapter } from './openai.js';
 import { AnthropicAdapter } from './anthropic.js';
 import { OllamaAdapter } from './ollama.js';
+import { GeminiAdapter } from './gemini.js';
 
 const adapterMap = {
   openai: OpenAIAdapter,
   anthropic: AnthropicAdapter,
   ollama: OllamaAdapter,
-  // deepseek / gemini 可以后续扩展
+  gemini: GeminiAdapter,
 };
 
 export function createAdapter(config: ProviderConfig): ProviderAdapter {

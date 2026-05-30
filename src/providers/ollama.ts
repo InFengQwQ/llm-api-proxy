@@ -1,5 +1,5 @@
-import type { ChatCompletionRequest, ChatCompletionResponse, StreamChunk, ProviderHealth } from '../../types/api.js';
-import type { ProviderConfig } from '../../config/index.js';
+import type { ChatCompletionRequest, ChatCompletionResponse, StreamChunk, ProviderHealth } from '../types/api.js';
+import type { ProviderConfig } from '../config/index.js';
 import type { ProviderAdapter } from './base.js';
 
 export class OllamaAdapter implements ProviderAdapter {

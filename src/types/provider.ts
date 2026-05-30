@@ -4,13 +4,6 @@ export type ProviderType = 'openai' | 'anthropic' | 'deepseek' | 'gemini' | 'oll
 
 export type ProviderCapability = 'chat' | 'streaming' | 'tools';
 
-export interface ProviderHealth {
-  provider: string;
-  status: 'healthy' | 'degraded' | 'unavailable';
-  latency_ms: number;
-  error_rate: number;
-}
-
 export interface Provider {
   name: string; // 用户自定义的别名
   type: ProviderType;

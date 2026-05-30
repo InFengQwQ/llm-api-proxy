@@ -1,8 +1,8 @@
 import express, { type Request, type Response, type NextFunction } from 'express';
-import type { ChatCompletionRequest } from '../types/api.js';
-import { Router } from '../router/index.js';
-import { loadConfig } from '../config/index.js';
-import { initDatabase, getDb } from '../db/index.js';
+import type { ChatCompletionRequest } from './types/api.js';
+import { Router } from './router/index.js';
+import { loadConfig } from './config/index.js';
+import { initDatabase, getDb } from './db/index.js';
 
 export function createApp(router: Router) {
   const app = express();
@@ -24,30 +24,32 @@ export function createApp(router: Router) {
       }
 
       const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      const response = await router.route(body.model, body, requestId);
+      const sessionId = req.headers['x-session-id'] as string | undefined;
+      const response = await router.route(body.model, body, requestId, sessionId);
 
       if (body.stream) {
-        // 流式响应：直接管道 SSE
+        // 流式响应：读取 Web Response 并写入 Express Response
         res.set({
           'Content-Type': 'text/event-stream; charset=utf-8',
           'Cache-Control': 'no-cache',
           'Connection': 'keep-alive',
           'X-Request-Id': requestId,
+          'Transfer-Encoding': 'chunked',
         });
-        // 将 Response body pipe 到 res
+        res.flushHeaders();
         const reader = (response.body as ReadableStream<Uint8Array>).getReader();
-        const stream = new ReadableStream({
-          async start(controller) {
+        const pump = async () => {
+          try {
             while (true) {
               const { done, value } = await reader.read();
-              if (done) { controller.close(); break; }
-              controller.enqueue(value);
+              if (done) { res.end(); break; }
+              res.write(value);
             }
-          },
-        });
-        res.set('Transfer-Encoding', 'chunked');
-        res.flushHeaders();
-        stream.pipeTo(res);
+          } catch {
+            res.end();
+          }
+        };
+        pump();
         return;
       }
 
@@ -81,26 +83,30 @@ export function createApp(router: Router) {
         stream: body.stream,
       };
 
-      const response = await router.route(body.model, chatRequest, requestId);
+      const sessionId = req.headers['x-session-id'] as string | undefined;
+      const response = await router.route(body.model, chatRequest, requestId, sessionId);
 
       if (body.stream) {
         res.set({
           'Content-Type': 'text/event-stream; charset=utf-8',
           'Cache-Control': 'no-cache',
           'X-Request-Id': requestId,
-        });
-        const reader = (response.body as ReadableStream<Uint8Array>).getReader();
-        const stream = new ReadableStream({
-          async start(controller) {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) { controller.close(); break; }
-              controller.enqueue(value);
-            }
-          },
+          'Transfer-Encoding': 'chunked',
         });
         res.flushHeaders();
-        stream.pipeTo(res);
+        const reader = (response.body as ReadableStream<Uint8Array>).getReader();
+        const pump = async () => {
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) { res.end(); break; }
+              res.write(value);
+            }
+          } catch {
+            res.end();
+          }
+        };
+        pump();
         return;
       }
 
@@ -132,6 +138,16 @@ export function createApp(router: Router) {
       return;
     }
     res.json(health);
+  });
+
+  // Auto 路由组列表
+  app.get('/admin/auto-routing', (_req, res) => {
+    res.json(router.listAutoRoutingGroups());
+  });
+
+  // 热度降权状态
+  app.get('/admin/auto-routing/heat', (_req, res) => {
+    res.json(router.getModelHeatInfo());
   });
 
   // 请求日志

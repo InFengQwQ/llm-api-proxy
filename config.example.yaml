@@ -1,50 +1,559 @@
-# 服务器配置
 server:
-  host: "0.0.0.0"
-  port: 3000
-  master_key: ""  # 可选，设置后所有请求需要 Authorization: Bearer <master_key>
+  host: "127.0.0.1"
+  port: 8348
+  master_key: ""
 
-# Provider 配置
 providers:
-  # Anthropic 示例
-  - name: "我的Claude"
-    type: anthropic
-    api_key: "${ANTHROPIC_API_KEY}"
-    models:
-      - claude-sonnet-4-7
-      - claude-haiku-4-5
-    circuit_breaker:
-      failure_threshold: 3
-      recovery_timeout: 30
-
-  # OpenAI 示例
-  - name: "我的OpenAI"
+  - name: "OpenRouter"
     type: openai
-    api_key: "${OPENAI_API_KEY}"
+    api_key: "${OPENROUTER_API_KEY}"
+    base_url: "https://openrouter.ai/api/v1"
     models:
-      - gpt-4o
-      - gpt-4o-mini
-      - gpt-4.5
+      - nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+      - poolside/laguna-xs.2:free
+      - poolside/laguna-m.1:free
+      - deepseek/deepseek-v4-flash:free
+      - moonshotai/kimi-k2.6:free
+      # - google/gemma-4-26b-a4b-it:free  # 400
+      - google/gemma-4-31b-it:free
+      - nvidia/nemotron-3-super-120b-a12b:free
+      # - minimax/minimax-m2.5:free  # 404
+      # - liquidai/lfm-2.5-1.2b-thinking:free  # 400
+      # - liquidai/lfm-2.5-1.2b-instruct:free  # 400
+      - nvidia/nemotron-3-nano-30b-a3b:free
+      - nvidia/nemotron-nano-12b-v2-vl:free
+      - qwen/qwen3-next-80b-a3b-instruct:free
+      - nvidia/nemotron-nano-9b-v2:free
+      - openai/gpt-oss-120b:free
+      - openai/gpt-oss-20b:free
+      - z-ai/glm-4.5-air:free
+      - qwen/qwen3-coder:free
+      - cognitivecomputations/dolphin-mistral-24b-venice-edition:free
+      - meta-llama/llama-3.3-70b-instruct:free
+      - meta-llama/llama-3.2-3b-instruct:free
+      - nousresearch/hermes-3-llama-3.1-405b:free
     circuit_breaker:
       failure_threshold: 3
       recovery_timeout: 30
 
-  # 本地 Ollama 示例
-  - name: "本地Ollama"
-    type: ollama
-    base_url: "http://localhost:11434"
-    models:
-      - llama3
-      - qwen2.5
-    circuit_breaker:
-      failure_threshold: 5
-      recovery_timeout: 60
+  # - name: "Groq"
+  #   type: openai
+  #   api_key: "${GROQ_API_KEY}"
+  #   base_url: "https://api.groq.com/openai/v1"
+  #   models:
+  #   circuit_breaker:
+  #     failure_threshold: 3
+  #     recovery_timeout: 30
 
-# 数据库配置
+  - name: "NVIDIA"
+    type: openai
+    api_key: "${NVIDIA_API_KEY}"
+    base_url: "https://integrate.api.nvidia.com/v1"
+    models:
+      - "minimaxai/minimax-m2.7"
+      - "z-ai/glm-5.1"
+      - "stepfun-ai/step-3.7-flash"
+      # - "stepfun-ai/step-3.5-flash"
+      # - "moonshotai/kimi-k2.6"
+      # - "mistralai/mistral-large-3"
+      # - "qwen/qwen3-coder-480b-a35b-instruct"
+      # - "qwen/qwen3.5-122b-a10b"
+      # - "qwen/qwen3.5-397b-a17b"
+      # - "openai/gpt-oss-120b"
+      # - "openai/gpt-oss-20b"
+      # - "deepseek-ai/deepseek-v4-flash"
+      # - "deepseek-ai/deepseek-v4-pro"
+      # - "deepseek-ai/deepseek-coder-6.7b-instruct"
+    circuit_breaker:
+      failure_threshold: 3
+      recovery_timeout: 30
+
+  # - name: "GitHubModels"
+  #   type: openai
+  #   api_key: "${GITHUB_MODELS_API_KEY}"
+  #   base_url: "https://models.github.ai/inference"
+  #   models:
+  #   circuit_breaker:
+  #     failure_threshold: 3
+  #     recovery_timeout: 30
+
+  # - name: "Cloudflare"
+  #   type: openai
+  #   api_key: "${CLOUDFLARE_API_KEY}"
+  #   base_url: "https://api.cloudflare.com/client/v4/accounts/f127d03f04d6fb3aea6e30e6bccd7507/ai"
+  #   models:
+  #     - "@cf/meta/llama-4-scout-17b-16e-instruct"
+  #     - "@cf/google/gemma-4-26b-a4b-it"
+  #     - "@cf/mistralai/mistral-small-3.1-24b-instruct"
+  #     - "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+  #     - "@cf/meta/llama-3.1-8b-instruct-fp8-fast"
+  #     - "@cf/meta/llama-3.2-11b-vision-instruct"
+  #     - "@cf/qwen/qwq-32b"
+  #     - "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b"
+  #   circuit_breaker:
+  #     failure_threshold: 3
+  #     recovery_timeout: 30
+
+  # - name: "SiliconFlow"
+  #   type: openai
+  #   api_key: "${SILICONFLOW_API_KEY}"
+  #   base_url: "https://api.siliconflow.com/v1"
+  #   models:
+  #     - deepseek-ai/DeepSeek-V4-Flash
+  #     - deepseek-ai/DeepSeek-V4-Pro
+  #     - moonshotai/Kimi-K2.6
+  #     - Qwen/Qwen3.6-35B-A3B
+  #     - Qwen/Qwen3.6-27B
+  #     - zai-org/GLM-5.1
+  #     - zai-org/GLM-5
+  #     - zai-org/GLM-4.7
+  #     - Qwen/Qwen3.5-397B-A17B
+  #     - Qwen/Qwen3.5-122B-A10B
+  #     - Qwen/Qwen3-32B
+  #     - Qwen/Qwen3-14B
+  #     - Qwen/Qwen3-8B
+  #     - Qwen/Qwen2.5-7B-Instruct
+  #     - stepfun-ai/Step-3.5-Flash
+  #     - MiniMaxAI/MiniMax-M2.5
+  #     - openai/gpt-oss-120b
+  #     - openai/gpt-oss-20b
+  #     - zai-org/GLM-4.5-Air
+  #     - google/gemma-4-26B-A4B-it
+  #     - google/gemma-4-31B-it
+  #     - deepseek-ai/DeepSeek-R1
+  #     - deepseek-ai/DeepSeek-V3.1-Terminus
+  #   circuit_breaker:
+  #     failure_threshold: 3
+  #     recovery_timeout: 30
+
+  # - name: "HuggingFace"
+  #   type: openai
+  #   api_key: "${HUGGINGFACE_API_KEY}"
+  #   base_url: "https://api-inference.huggingface.co/v1"
+  #   models:
+  #     - Qwen/Qwen3-0.6B
+  #     - openai-community/gpt2
+  #     - Qwen/Qwen2.5-1.5B-Instruct
+  #     - Qwen/Qwen2.5-3B-Instruct
+  #     - Qwen/Qwen2.5-7B-Instruct
+  #     - Qwen/Qwen3-8B
+  #     - Qwen/Qwen3-4B
+  #     - facebook/opt-125m
+  #     - meta-llama/Llama-3.1-8B-Instruct
+  #     - meta-llama/Llama-3.2-1B-Instruct
+  #     - openai/gpt-oss-20b
+  #     - Qwen/Qwen3-4B-Instruct-2507
+  #     - deepseek-ai/DeepSeek-V4-Pro
+  #     - deepseek-ai/DeepSeek-R1
+  #     - Qwen/Qwen3-32B
+  #     - deepseek-ai/DeepSeek-R1-0528
+  #     - openai/gpt-oss-120b
+  #     - dphn/dolphin-2.9.1-yi-1.5-34b
+  #     - Qwen/Qwen3-1.7B
+  #     - distilbert/distilgpt2
+  #     - Qwen/Qwen2-1.5B-Instruct
+  #     - Qwen/Qwen2.5-0.5B-Instruct
+  #     - deepseek-ai/DeepSeek-V3.2
+  #     - Qwen/Qwen3Guard-Gen-0.6B
+  #     - mistralai/Mistral-7B-Instruct-v0.2
+  #     - nvidia/Gemma-4-31B-IT-NVFP4
+  #     - Andycurrent/Gemma-3-1B-it-GLM-4.7-Flash-Heretic-Uncensored-Thinking_GGUF
+  #     - Qwen/Qwen3-0.6B-FP8
+  #     - moonshotai/Kimi-K2-Instruct-0905
+  #     - Qwen/Qwen2.5-Coder-7B-Instruct
+  #     - TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  #     - meta-llama/Llama-3.2-1B
+  #     - RedHatAI/Llama-3.2-1B-Instruct-FP8-dynamic
+  #     - Qwen/Qwen2.5-0.5B
+  #     - Qwen/Qwen2.5-Coder-14B-Instruct
+  #     - prefeitura-rio/Rio-3.0-Open-Mini
+  #     - Qwen/Qwen3-30B-A3B
+  #     - Qwen/Qwen2.5-14B-Instruct
+  #     - meta-llama/Meta-Llama-3-8B
+  #     - Qwen/Qwen3-Coder-30B-A3B-Instruct
+  #     - meta-llama/Llama-3.2-3B-Instruct
+  #     - Qwen/Qwen3-14B
+  #     - zai-org/GLM-5-FP8
+  #     - nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  #     - apple/OpenELM-1_1B-Instruct
+  #     - meta-llama/Meta-Llama-3-8B-Instruct
+  #     - microsoft/Phi-4-mini-instruct
+  #     - ibm-research/PowerMoE-3b
+  #     - Qwen/Qwen2-0.5B-Instruct
+  #     - google/gemma-3-1b-it
+  #     - MiniMaxAI/MiniMax-M2.7
+  #     - nvidia/DeepSeek-R1-0528-NVFP4-v2
+  #     - openai-community/gpt2-large
+  #     - nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+  #     - datajuicer/LLaMA-1B-dj-refine-150B
+  #     - RedHatAI/Qwen2.5-1.5B-quantized.w8a8
+  #     - meta-llama/Llama-3.1-8B
+  #     - sshleifer/tiny-gpt2
+  #     - zai-org/GLM-5.1-FP8
+  #     - nvidia/Gemma-4-26B-A4B-NVFP4
+  #     - Qwen/Qwen2.5-Coder-3B
+  #     - Qwen/Qwen2.5-Coder-32B-Instruct
+  #     - Qwen/Qwen3-30B-A3B-Instruct-2507
+  #     - deepseek-ai/DeepSeek-V2-Lite-Chat
+  #     - h2oai/h2ovl-mississippi-800m
+  #     - deepseek-ai/DeepSeek-V3
+  #     - h2oai/h2ovl-mississippi-2b
+  #     - meta-llama/Llama-3.2-3B
+  #     - Qwen/Qwen2.5-7B
+  #     - RedHatAI/Llama-3.2-1B-Instruct-FP8
+  #     - zai-org/GLM-4.7-Flash
+  #     - nvidia/Kimi-K2.5-NVFP4
+  #     - Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
+  #     - Qwen/Qwen2.5-32B-Instruct
+  #     - Qwen/Qwen3-Coder-Next
+  #     - deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
+  #     - EleutherAI/gpt-neo-2.7B
+  #     - meta-llama/Llama-3.3-70B-Instruct
+  #     - Qwen/Qwen2.5-72B-Instruct
+  #     - Qwen/Qwen3-4B-Instruct-2507-FP8
+  #     - nvidia/Qwen3.5-397B-A17B-NVFP4
+  #     - microsoft/phi-4
+  #     - GSAI-ML/LLaDA-8B-Instruct
+  #     - mistralai/Mistral-7B-v0.1
+  #     - facebook/opt-1.3b
+  #     - nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8
+  #     - sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP
+  #     - meta-llama/Llama-2-7b-hf
+  #     - Qwen/Qwen3-4B-Base
+  #     - nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+  #     - Qwen/Qwen2.5-Math-1.5B
+  #     - kaitchup/Phi-3-mini-4k-instruct-gptq-4bit
+  #     - Qwen/Qwen2.5-1.5B
+  #     - deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+  #     - microsoft/Phi-tiny-MoE-instruct
+  #     - nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+  #     - state-spaces/mamba-130m-hf
+  #     - meta-llama/Llama-3.1-70B-Instruct
+  #     - MiniMaxAI/MiniMax-M2.5
+  #     - moonshotai/Kimi-K2-Instruct
+  #     - Qwen/Qwen2-7B-Instruct
+  #     - microsoft/Phi-3.5-mini-instruct
+  #     - Qwen/Qwen2-0.5B
+  #     - microsoft/Phi-3-mini-4k-instruct
+  #     - nvidia/Kimi-K2.6-NVFP4
+  #     - Qwen/Qwen3-Coder-Next-FP8
+  #     - Qwen/Qwen2.5-Coder-1.5B-Instruct
+  #     - cyankiwi/Qwen3-Next-80B-A3B-Instruct-AWQ-4bit
+  #     - Qwen/Qwen3-1.7B-Base
+  #     - ricdomolm/mini-coder-1.7b
+  #     - Qwen/Qwen3-4B-Thinking-2507
+  #     - Maykeye/TinyLLama-v0
+  #     - deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
+  #     - EleutherAI/gpt-neox-20b
+  #     - deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  #     - Qwen/Qwen2.5-3B
+  #     - RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8
+  #     - deepseek-ai/DeepSeek-V3-0324
+  #     - Qwen/Qwen3-0.6B-Base
+  #     - Doradus-AI/RnJ-1-Instruct-FP8
+  #     - Qwen/Qwen3-8B-FP8
+  #     - microsoft/phi-2
+  #     - ibm-granite/granite-4.0-h-small
+  #     - ansulev/Darwin-9B-NEG
+  #     - bigscience/bloom-560m
+  #     - Qwen/Qwen2.5-Coder-7B
+  #     - Qwen/Qwen3-235B-A22B-Instruct-2507-FP8
+  #     - Dream-org/Dream-v0-Instruct-7B
+  #     - deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+  #     - huihui-ai/Qwen2.5-72B-Instruct-abliterated
+  #     - Qwen/Qwen3-235B-A22B
+  #     - openai-community/gpt2-medium
+  #     - deepseek-ai/DeepSeek-V2-Lite
+  #     - cyankiwi/GLM-4.7-Flash-AWQ-4bit
+  #     - NexVeridian/Qwen3-Coder-Next-8bit
+  #     - EleutherAI/gpt-neo-125m
+  #     - cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit
+  #     - nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8
+  #     - prefeitura-rio/Rio-3.0-Open
+  #     - mlx-community/gpt-oss-20b-MXFP4-Q8
+  #     - unsloth/GLM-4.7-Flash
+  #     - lmstudio-community/DeepSeek-R1-0528-Qwen3-8B-MLX-4bit
+  #     - LiquidAI/LFM2.5-1.2B-Instruct
+  #     - zerofata/L3.3-GeneticLemonade-Final-v2-70B
+  #     - unsloth/Llama-3.2-1B-Instruct
+  #     - Qwen/Qwen2.5-Math-1.5B-Instruct
+  #     - IlyaGusev/saiga_llama3_8b
+  #     - deepseek-ai/deepseek-coder-7b-instruct-v1.5
+  #     - Qwen/Qwen3-32B-FP8
+  #     - nvidia/NVIDIA-Nemotron-Nano-9B-v2
+  #     - unsloth/mistral-7b-v0.3-bnb-4bit
+  #     - tiiuae/falcon-7b
+  #     - Qwen/Qwen3-8B-Base
+  #     - nvidia/Llama-3.1-8B-Instruct-FP8
+  #     - google/gemma-2-2b-it
+  #     - jinaai/ReaderLM-v2
+  #     - google/gemma-2-9b-it
+  #     - nvidia/Nemotron-Mini-4B-Instruct
+  #     - lmstudio-community/DeepSeek-R1-0528-Qwen3-8B-MLX-8bit
+  #     - Qwen/Qwen3-Next-80B-A3B-Instruct
+  #     - zai-org/GLM-4.5-Air
+  #     - LSX-UniWue/LLaMmlein_1B_prerelease
+  #     - TIGER-Lab/VLM2Vec-Full
+  #     - unsloth/Qwen2.5-7B-Instruct
+  #     - Zyphra/Zamba2-1.2B-instruct
+  #     - lmstudio-community/LFM2-24B-A2B-MLX-4bit
+  #     - stepfun-ai/Step-3.5-Flash
+  #     - OBLITERATUS/gemma-4-E4B-it-OBLITERATED
+  #     - nvidia/MiniMax-M2.7-NVFP4
+  #     - nvidia/Nemotron-Labs-Diffusion-8B-Base
+  #     - lmstudio-community/LFM2-24B-A2B-MLX-8bit
+  #     - lmstudio-community/LFM2-24B-A2B-MLX-5bit
+  #     - lmstudio-community/LFM2-24B-A2B-MLX-6bit
+  #     - unsloth/Qwen2.5-7B-Instruct-bnb-4bit
+  #     - codellama/CodeLlama-7b-hf
+  #     - google/gemma-2b
+  #     - bineric/lynx-instruct-30b
+  #     - Qwen/Qwen3-30B-A3B-Instruct-2507-FP8
+  #     - unsloth/Meta-Llama-3.1-8B-Instruct
+  #     - meta-llama/Llama-2-7b-chat-hf
+  #     - farbodtavakkoli/OTel-LLM-8.3B-IT
+  #     - mistralai/Mistral-7B-Instruct-v0.1
+  #     - mlx-community/Kimi-K2.5
+  #     - EleutherAI/gpt-j-6b
+  #     - nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8
+  #     - allenai/OLMo-2-0425-1B
+  #     - hmellor/Ilama-3.2-1B
+  #     - bigscience/bloomz-560m
+  #     - mlabonne/Qwen3-30B-A3B-abliterated
+  #     - humarin/chatgpt_paraphraser_on_T5_base
+  #     - microsoft/Phi-3-vision-128k-instruct
+  #     - microsoft/DialoGPT-medium
+  #     - Qwen/Qwen2.5-Coder-1.5B
+  #     - bigcode/tiny_starcoder_py
+  #     - microsoft/Phi-3-mini-128k-instruct
+  #     - internlm/internlm-chat-7b
+  #     - inclusionAI/LLaDA2.0-mini
+  #     - allenai/Olmo-3-7B-Instruct
+  #     - google/gemma-2-2b
+  #     - nvidia/Llama-3_3-Nemotron-Super-49B-v1_5
+  #     - TrevorJS/gemma-4-26B-A4B-it-uncensored
+  #     - RedHatAI/Meta-Llama-3.1-8B-FP8
+  #     - allenai/Olmo-3-1025-7B
+  #     - farbodtavakkoli/OTel-LLM-1.2B-IT
+  #     - nvidia/NVIDIA-Nemotron-Nano-9B-v2-Japanese
+  #     - NousResearch/Hermes-3-Llama-3.1-8B
+  #     - Qwen/Qwen-7B-Chat
+  #     - cyberagent/open-calm-3b
+  #     - nvidia/Qwen2.5-VL-7B-Instruct-NVFP4
+  #     - distil-labs/distil-lfm25-shellper
+  #     - meta-llama/Llama-3.1-405B-Instruct
+  #     - openai-community/openai-gpt
+  #     - mlx-community/Qwen3.5-9B-OptiQ-4bit
+  #     - lmstudio-community/GLM-4.7-Flash-MLX-8bit
+  #     - datificate/gpt2-small-spanish
+  #     - allenai/Olmo-3-7B-Think
+  #     - poolside/Laguna-XS.2
+  #     - baichuan-inc/Baichuan2-7B-Chat
+  #     - unsloth/Llama-3.1-8B-Instruct
+  #     - lmstudio-community/GLM-4.7-Flash-MLX-6bit
+  #     - Qwen/Qwen2.5-Coder-3B-Instruct
+  #     - LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct
+  #     - cckevinn/SeeClick
+  #     - deepseek-ai/DeepSeek-V3.1
+  #     - nvidia/Llama-3_3-Nemotron-Super-49B-v1_5-FP8
+  #     - xlnet/xlnet-base-cased
+  #     - mlx-community/Kimi-K2.6-mlx-DQ3_K_M-q8
+  #     - Ex0bit/Qwen3.6-35B-A3B-PRISM-NVFP4
+  #     - lmstudio-community/Qwen3-Coder-30B-A3B-Instruct-MLX-4bit
+  #     - ai-forever/mGPT
+  #     - microsoft/Phi-mini-MoE-instruct
+  #     - unsloth/Qwen3-14B-unsloth-bnb-4bit
+  #     - bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4
+  #     - RedHatAI/Meta-Llama-3.1-70B-Instruct-quantized.w4a16
+  #     - facebook/opt-350m
+  #     - deepseek-ai/DeepSeek-V3.2-Exp
+  #     - deepcogito/cogito-v1-preview-qwen-32B
+  #     - unsloth/Qwen2.5-3B-Instruct-unsloth-bnb-4bit
+  #     - moonshotai/Kimi-K2-Thinking
+  #     - ibm-granite/granite-4.0-micro
+  #     - cyankiwi/MiniMax-M2.7-AWQ-4bit
+  #     - Qwen/Qwen2.5-Math-7B
+  #     - Qwen/Qwen3-Next-80B-A3B-Instruct-FP8
+  #     - google/gemma-1.1-2b-it
+  #     - Qwen/Qwen3-4B-Thinking-2507-FP8
+  #     - unsloth/Qwen3-4B-unsloth-bnb-4bit
+  #     - JackFram/llama-68m
+  #     - huggyllama/llama-7b
+  #     - ibm-research/PowerLM-3b
+  #     - unsloth/Nemotron-3-Nano-30B-A3B
+  #     - HuggingFaceH4/zephyr-7b-beta
+  #     - Jiunsong/supergemma4-26b-uncensored-gguf-v2
+  #     - Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8
+  #     - LilaRest/gemma-4-31B-it-NVFP4-turbo
+  #     - Qwen/Qwen1.5-MoE-A2.7B
+  #     - lmstudio-community/Qwen3-Coder-30B-A3B-Instruct-MLX-5bit
+  #     - lmstudio-community/Qwen3-Coder-30B-A3B-Instruct-MLX-8bit
+  #     - deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
+  #     - cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit
+  #     - baichuan-inc/Baichuan-7B
+  #     - TitanML/tiny-mixtral
+  #     - GadflyII/GLM-4.7-Flash-NVFP4
+  #     - lmstudio-community/Qwen3-Coder-30B-A3B-Instruct-MLX-6bit
+  #     - lmstudio-community/Qwen2.5-Coder-14B-Instruct-MLX-4bit
+  #     - Qwen/Qwen3-30B-A3B-FP8
+  #     - NousResearch/Llama-2-7b-hf
+  #     - farbodtavakkoli/OTel-LLM-0.6B-IT
+  #     - unsloth/Qwen3-4B-Instruct-2507-unsloth-bnb-4bit
+  #     - meta-llama/Llama-3.1-405B
+  #     - Qwen/Qwen3-14B-FP8
+  #     - RedHatAI/DeepSeek-Coder-V2-Lite-Instruct-FP8
+  #     - unsloth/Llama-3.2-3B-Instruct
+  #     - XiaomiMiMo/MiMo-7B-Base
+  #     - EleutherAI/pythia-14m
+  #     - openai-community/gpt2-xl
+  #     - unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit
+  #     - omni-research/Tarsier-7b
+  #     - unsloth/Qwen2.5-7B-Instruct-unsloth-bnb-4bit
+  #     - microsoft/biogpt
+  #     - Efficient-Large-Model/gemma-2-2b-it
+  #     - meta-llama/Llama-2-70b-chat-hf
+  #     - Salesforce/codegen-350M-mono
+  #     - zai-org/GLM-5.1
+  #     - nvidia/MiniMax-M2.5-NVFP4
+  #     - unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit
+  #     - microsoft/Phi-3.5-MoE-instruct
+  #     - zai-org/GLM-4.5
+  #     - unsloth/mistral-7b-instruct-v0.3-bnb-4bit
+  #     - rinna/japanese-gpt-neox-small
+  #     - sapientinc/HRM-Text-1B
+  #     - Qwen/Qwen3-235B-A22B-Instruct-2507
+  #     - Qwen/Qwen2-1.5B
+  #     - google/gemma-2-27b-it
+  #     - Nanbeige/Nanbeige4.1-3B
+  #     - Qwen/Qwen1.5-7B
+  #     - Qwen/Qwen3-30B-A3B-Thinking-2507
+  #     - NousResearch/Meta-Llama-3-8B
+  #     - RedHatAI/Qwen2.5-Coder-14B-Instruct-FP8-dynamic
+  #     - unsloth/Qwen3-0.6B-unsloth-bnb-4bit
+  #     - inclusionAI/LLaDA2.1-flash
+  #     - ibm-granite/granite-4.0-tiny-preview
+  #     - LiquidAI/LFM2-1.2B
+  #     - cyankiwi/Qwen3-Next-80B-A3B-Thinking-AWQ-4bit
+  #     - nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+  #     - Qwen/Qwen-VL
+  #     - lmstudio-community/Qwen2.5-Coder-14B-Instruct-MLX-8bit
+  #     - cyankiwi/Qwen3-30B-A3B-Thinking-2507-AWQ-4bit
+  #     - RedHatAI/Qwen3-30B-A3B-FP8-dynamic
+  #     - LGAI-EXAONE/EXAONE-Deep-7.8B
+  #     - Qwen/Qwen3-235B-A22B-FP8
+  #     - tiiuae/falcon-mamba-7b
+  #     - lmsys/vicuna-7b-v1.5
+  #     - BioMistral/BioMistral-7B
+  #     - bigcode/starcoder2-3b
+  #     - naver-hyperclovax/HyperCLOVAX-SEED-Think-32B
+  #     - meta-llama/Meta-Llama-3-70B
+  #     - MiniMaxAI/MiniMax-M2
+  #     - tiiuae/falcon-7b-instruct
+  #     - kmhf/hf-moshiko
+  #     - Qwen/Qwen2.5-32B
+  #     - Qwen/Qwen-VL-Chat
+  #     - pearl-ai/Llama-3.3-70B-Instruct-pearl
+  #     - EleutherAI/pythia-410m
+  #     - zai-org/GLM-5
+  #     - allenai/OLMoE-1B-7B-0924
+  #     - Salesforce/ctrl
+  #     - cais/HarmBench-Llama-2-13b-cls
+  #     - lmstudio-community/LFM2.5-1.2B-Instruct-MLX-8bit
+  #     - tiiuae/Falcon-H1-0.5B-Base
+  #     - lmstudio-community/LFM2.5-1.2B-Instruct-MLX-4bit
+  #     - facebook/xglm-564M
+  #     - lmstudio-community/LFM2.5-1.2B-Instruct-MLX-6bit
+  #     - allenai/wildguard
+  #     - ggml-org/stories15M_MOE
+  #     - unsloth/Qwen2.5-3B-Instruct
+  #     - google/reformer-crime-and-punishment
+  #     - moonshotai/Moonlight-16B-A3B-Instruct
+  #     - meta-llama/Llama-2-13b-chat-hf
+  #     - swiss-ai/Apertus-8B-Instruct-2509
+  #     - NousResearch/Meta-Llama-3-8B-Instruct
+  #     - deepseek-ai/DeepSeek-R1-Distill-Llama-70B
+  #     - naver-hyperclovax/HyperCLOVAX-SEED-Vision-Instruct-3B
+  #     - litert-community/Qwen2.5-1.5B-Instruct
+  #     - mtgv/MobileLLaMA-1.4B-Chat
+  #     - petals-team/StableBeluga2
+  #   circuit_breaker:
+  #     failure_threshold: 3
+  #     recovery_timeout: 30
+
+  - name: "LLM7"
+    type: openai
+    api_key: "${LLM7_API_KEY}"
+    base_url: "https://api.llm7.io/v1"
+    models:
+      - qwen3-235b-a22b-instruct-2507-fp8
+      # - kimi-k2.6  # 402 payment required
+      - minimax-m2.7
+      - gpt-oss-20b
+      - codestral-latest
+      - ministral-8b-2512
+      - GLM-4.6V-Flash
+      # - deepseek-v4-flash  # 402 payment required
+      # - deepseek-v3.1:671b-terminus  # 402 payment required
+      # - devstral-small-2:24b-cloud  # 402 payment required
+    circuit_breaker:
+      failure_threshold: 3
+      recovery_timeout: 30
+
+  # - name: "Gemini"
+  #   type: gemini
+  #   api_key: "${GEMINI_API_KEY}"
+  #   base_url: "https://generativelanguage.googleapis.com/v1beta"
+  #   models:
+  #     - gemini-2.5-flash
+  #     - gemini-2.5-flash-lite
+  #   circuit_breaker:
+  #     failure_threshold: 3
+  #     recovery_timeout: 30
+
 database:
   path: "./data/gateway.db"
 
-# 全局限流（可选）
 rate_limits:
   rpm: 60
   tpm: 90000
+
+# auto 路由组：调用方使用 model="auto:<group>" 触发
+# 自动在多个模型间轮询，429 时跳过热模型，同一会话尽量路由到同一模型
+auto_routing:
+  free:
+    targets:
+      - OpenRouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+      - OpenRouter/poolside/laguna-xs.2:free
+      - OpenRouter/poolside/laguna-m.1:free
+      - OpenRouter/deepseek/deepseek-v4-flash:free
+      - OpenRouter/moonshotai/kimi-k2.6:free
+      - OpenRouter/google/gemma-4-31b-it:free
+      - OpenRouter/nvidia/nemotron-3-super-120b-a12b:free
+      - OpenRouter/nvidia/nemotron-3-nano-30b-a3b:free
+      - OpenRouter/nvidia/nemotron-nano-12b-v2-vl:free
+      - OpenRouter/qwen/qwen3-next-80b-a3b-instruct:free
+      - OpenRouter/nvidia/nemotron-nano-9b-v2:free
+      - OpenRouter/openai/gpt-oss-120b:free
+      - OpenRouter/openai/gpt-oss-20b:free
+      - OpenRouter/z-ai/glm-4.5-air:free
+      - OpenRouter/qwen/qwen3-coder:free
+      - OpenRouter/cognitivecomputations/dolphin-mistral-24b-venice-edition:free
+      - OpenRouter/meta-llama/llama-3.3-70b-instruct:free
+      - OpenRouter/meta-llama/llama-3.2-3b-instruct:free
+      - OpenRouter/nousresearch/hermes-3-llama-3.1-405b:free
+  T1:
+    targets:
+      - OpenRouter/deepseek/deepseek-v4-flash:free
+      - OpenRouter/moonshotai/kimi-k2.6:free
+      - NVIDIA/minimaxai/minimax-m2.7
+      - NVIDIA/z-ai/glm-5.1
+  T2:
+    targets:
+      - NVIDIA/stepfun-ai/step-3.7-flash
+      - OpenRouter/google/gemma-4-31b-it:free
+      - OpenRouter/nvidia/nemotron-3-super-120b-a12b:free
+      - OpenRouter/qwen/qwen3-next-80b-a3b-instruct:free
+      - OpenRouter/openai/gpt-oss-120b:free
+      - OpenRouter/qwen/qwen3-coder:free
+      - OpenRouter/nousresearch/hermes-3-llama-3.1-405b:free
+    failure_threshold: 3

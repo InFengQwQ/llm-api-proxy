@@ -13,6 +13,7 @@ async function main() {
   // 初始化路由
   const router = new Router();
   router.register(config.providers);
+  router.registerAutoRouting(config.auto_routing ?? {});
 
   // 启动服务器
   const app = createApp(router);

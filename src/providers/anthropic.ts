@@ -2,9 +2,11 @@ import type {
   ChatCompletionRequest,
   ChatCompletionResponse,
   StreamChunk,
+  AnthropicMessageRequest,
+  AnthropicMessageResponse,
   ProviderHealth,
-} from '../../types/api.js';
-import type { ProviderConfig } from '../../config/index.js';
+} from '../types/api.js';
+import type { ProviderConfig } from '../config/index.js';
 import type { ProviderAdapter } from './base.js';
 
 export class AnthropicAdapter implements ProviderAdapter {
@@ -74,9 +76,9 @@ export class AnthropicAdapter implements ProviderAdapter {
     resp: AnthropicMessageResponse,
     model: string
   ): ChatCompletionResponse {
-    const parts = resp.content.map((block) => {
+    const parts = resp.content.map((block: { type: 'text' | 'tool_use'; text?: string; id?: string; name?: string; input?: Record<string, unknown> }) => {
       if (block.type === 'text') {
-        return { role: 'assistant' as const, content: block.text };
+        return { role: 'assistant' as const, content: block.text ?? '' };
       }
       if (block.type === 'tool_use') {
         return {
@@ -231,6 +233,7 @@ export class AnthropicAdapter implements ProviderAdapter {
                           index: 0,
                           id: event.id,
                           function: {
+                            name: '',
                             arguments: event.delta.partial_json,
                           },
                         },
