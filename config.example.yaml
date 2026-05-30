@@ -1,0 +1,50 @@
+# 服务器配置
+server:
+  host: "0.0.0.0"
+  port: 3000
+  master_key: ""  # 可选，设置后所有请求需要 Authorization: Bearer <master_key>
+
+# Provider 配置
+providers:
+  # Anthropic 示例
+  - name: "我的Claude"
+    type: anthropic
+    api_key: "${ANTHROPIC_API_KEY}"
+    models:
+      - claude-sonnet-4-7
+      - claude-haiku-4-5
+    circuit_breaker:
+      failure_threshold: 3
+      recovery_timeout: 30
+
+  # OpenAI 示例
+  - name: "我的OpenAI"
+    type: openai
+    api_key: "${OPENAI_API_KEY}"
+    models:
+      - gpt-4o
+      - gpt-4o-mini
+      - gpt-4.5
+    circuit_breaker:
+      failure_threshold: 3
+      recovery_timeout: 30
+
+  # 本地 Ollama 示例
+  - name: "本地Ollama"
+    type: ollama
+    base_url: "http://localhost:11434"
+    models:
+      - llama3
+      - qwen2.5
+    circuit_breaker:
+      failure_threshold: 5
+      recovery_timeout: 60
+
+# 数据库配置
+database:
+  path: "./data/gateway.db"
+
+# 全局限流（可选）
+rate_limits:
+  rpm: 60
+  tpm: 90000
