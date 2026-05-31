@@ -60,4 +60,3 @@ docker compose up -d
 if ($LASTEXITCODE -ne 0) { throw 'docker compose up failed' }
 
 Write-Host "Done. http://127.0.0.1:$port"
-docker compose logs -f

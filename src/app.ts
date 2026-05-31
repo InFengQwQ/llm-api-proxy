@@ -33,6 +33,16 @@ export function createApp(router: Router, requestLogger?: RequestLogger) {
       const response = await router.route(body.model, body, requestId, sessionId);
 
       if (body.stream) {
+        // 检查响应是否为真正的 SSE 流；若路由返回了 JSON 错误（非流式），
+        // 不应进入 SSE 流水线，否则会以 200 + text/event-stream 回传错误 JSON，
+        // 导致客户端显示空白（SSE 解析器无法解析 JSON）
+        const contentType = response.headers.get('Content-Type') || '';
+        if (!contentType.startsWith('text/event-stream')) {
+          const data = await response.json();
+          res.status(response.status).set('X-Request-Id', requestId).json(data);
+          return;
+        }
+
         // 流式响应：读取 Web Response 并写入 Express Response
         res.set({
           'Content-Type': 'text/event-stream; charset=utf-8',
@@ -93,6 +103,14 @@ export function createApp(router: Router, requestLogger?: RequestLogger) {
       const response = await router.route(body.model, chatRequest, requestId, sessionId);
 
       if (body.stream) {
+        // 检查响应是否为真正的 SSE 流（与 /v1/chat/completions 相同逻辑）
+        const contentType = response.headers.get('Content-Type') || '';
+        if (!contentType.startsWith('text/event-stream')) {
+          const data = await response.json();
+          res.status(response.status).set('X-Request-Id', requestId).json(data);
+          return;
+        }
+
         res.set({
           'Content-Type': 'text/event-stream; charset=utf-8',
           'Cache-Control': 'no-cache',

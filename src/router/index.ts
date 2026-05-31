@@ -322,6 +322,7 @@ export class Router {
     const iter = iterator ?? entry.adapter.sendStreaming(request);
     let finished = false;
     let headEmitted = headChunk === undefined;
+    let chunksSent = 0; // 追踪是否实际发送了内容 chunk
 
     return new ReadableStream<Uint8Array>({
       async pull(controller) {
@@ -329,6 +330,7 @@ export class Router {
           // 先发送预取的首个 chunk
           if (!headEmitted && headChunk !== undefined) {
             headEmitted = true;
+            chunksSent++;
             controller.enqueue(encoder.encode(`data: ${JSON.stringify(headChunk)}\n\n`));
             return;
           }
@@ -337,13 +339,20 @@ export class Router {
           if (done) {
             if (!finished) {
               finished = true;
-              entry.breaker.recordSuccess();
-              logRequestAsync(requestId, modelId, providerName, 0, 200);
+              if (chunksSent === 0) {
+                // 流未产生任何内容 chunk：视为上游异常，记录失败
+                entry.breaker.recordFailure();
+                logRequestAsync(requestId, modelId, providerName, 0, 502, 'Empty stream (no chunks)');
+              } else {
+                entry.breaker.recordSuccess();
+                logRequestAsync(requestId, modelId, providerName, 0, 200);
+              }
             }
             controller.enqueue(encoder.encode('data: [DONE]\n\n'));
             controller.close();
             return;
           }
+          chunksSent++;
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
         } catch (err) {
           // 流中途失败：记录故障、发送 SSE error 事件并正常关闭

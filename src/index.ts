@@ -3,6 +3,7 @@ import { createApp } from './app.js';
 import { loadConfig } from './config/index.js';
 import { initDatabase } from './db/index.js';
 import { Router } from './router/index.js';
+import { parseModelId } from './providers/index.js';
 import { RequestLogger } from './middleware/request-logger.js';
 
 async function main() {
@@ -18,6 +19,47 @@ async function main() {
   const router = new Router();
   router.register(config.providers);
   router.registerAutoRouting(config.auto_routing ?? {});
+
+  // 启动时预热连接：对每个 auto-routing group 的首个 target 发起轻量 DNS/TLS 预热
+  // 减少首次请求时的连接冷启动延迟，但失败不阻塞启动
+  if (config.auto_routing) {
+    console.log('   Warming up auto-routing targets...');
+    const warmed = new Set<string>();
+    for (const [groupName, group] of Object.entries(config.auto_routing)) {
+      for (const target of group.targets) {
+        if (warmed.has(target)) continue;
+        warmed.add(target);
+        try {
+          const { provider_name } = parseModelId(target);
+          const providerConfig = config.providers.find(p => p.name === provider_name);
+          if (providerConfig?.base_url && providerConfig.api_key) {
+            const warmUrl = `${providerConfig.base_url}/models`;
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 3000);
+            try {
+              await fetch(warmUrl, {
+                headers: {
+                  'Authorization': `Bearer ${providerConfig.api_key}`,
+                  'Content-Type': 'application/json',
+                },
+                signal: controller.signal,
+              });
+              console.log(`     ${provider_name}: warmup OK`);
+            } catch {
+              // 预热失败静默忽略，实际请求时再处理
+              console.log(`     ${provider_name}: warmup skipped (unreachable or timeout)`);
+            } finally {
+              clearTimeout(timeout);
+            }
+          }
+        } catch {
+          // 解析失败，跳过
+        }
+        break; // 每组只预热第一个 target（同 provider 共享连接）
+      }
+    }
+    console.log('   Warmup complete');
+  }
 
   // 启动服务器
   const app = createApp(router, requestLogger);
