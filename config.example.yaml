@@ -513,6 +513,10 @@ providers:
 database:
   path: "./data/gateway.db"
 
+# HTTP 请求文件日志（每次启动创建新目录）
+logging:
+  log_dir: "logs"
+
 rate_limits:
   rpm: 60
   tpm: 90000

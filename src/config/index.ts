@@ -62,6 +62,9 @@ const ConfigSchema = z.object({
   database: z.object({
     path: z.string().default('./data/gateway.db'),
   }),
+  logging: z.object({
+    log_dir: z.string().default('logs'),
+  }).optional().default({}),
   rate_limits: RateLimitSchema.optional(),
   /** auto 路由组，调用方使用 model="auto:<group>" 触发 */
   auto_routing: z.record(AutoRoutingGroupSchema).optional(),

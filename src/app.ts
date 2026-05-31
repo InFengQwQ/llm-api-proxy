@@ -3,10 +3,16 @@ import type { ChatCompletionRequest } from './types/api.js';
 import { Router } from './router/index.js';
 import { loadConfig } from './config/index.js';
 import { initDatabase, getDb } from './db/index.js';
+import { type RequestLogger } from './middleware/request-logger.js';
 
-export function createApp(router: Router) {
+export function createApp(router: Router, requestLogger?: RequestLogger) {
   const app = express();
   app.use(express.json({ limit: '10mb' }));
+
+  // HTTP 请求文件日志中间件（在所有路由之前）
+  if (requestLogger) {
+    app.use(requestLogger.middleware());
+  }
 
   // 健康检查
   app.get('/health', (_req, res) => {

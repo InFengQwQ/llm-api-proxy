@@ -1,18 +1,31 @@
-FROM node:22-alpine
-
+# ============================================================
+# Stage 1: build
+# ============================================================
+FROM node:22-alpine AS build
 WORKDIR /app
 
-# 先复制依赖文件，安装依赖
+RUN apk add --no-cache python3 make g++
+
 COPY package*.json ./
-RUN npm install
+RUN npm ci
 
-# 再复制源码
 COPY . .
-RUN npm run build
+RUN npm run build && npm prune --production
 
-# 数据目录
-RUN mkdir -p /app/data
+# ============================================================
+# Stage 2: production
+# ============================================================
+FROM node:22-alpine
+ARG PORT
+EXPOSE ${PORT}
 
-EXPOSE 3000
+RUN addgroup -S app && adduser -S app -G app
+WORKDIR /app
 
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/package.json ./
+RUN chown -R app:app /app && mkdir -p data logs && chown app:app data logs
+
+USER app
 CMD ["node", "dist/index.js"]

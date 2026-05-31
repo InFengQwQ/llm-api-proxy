@@ -1,24 +1,19 @@
-version: '3.9'
-
 services:
   llm-api-proxy:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        PORT: ${PORT}
     ports:
-      - "3000:3000"
+      - "${PORT}:${PORT}"
     volumes:
-      # 持久化数据库文件
       - ./data:/app/data
-      # 挂载配置（修改配置后重启容器即可生效）
+      - ./logs:/app/logs
       - ./config.yaml:/app/config.yaml:ro
-    environment:
-      # 在此填写实际的 API Key，或在 config.yaml 中用 ${VAR} 引用
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:${PORT}/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
