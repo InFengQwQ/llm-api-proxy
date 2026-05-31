@@ -2,8 +2,6 @@ import type {
   ChatCompletionRequest,
   ChatCompletionResponse,
   StreamChunk,
-  AnthropicMessageRequest,
-  AnthropicMessageResponse,
   ProviderHealth,
 } from '../types/api.js';
 import type { ProviderConfig } from '../config/index.js';

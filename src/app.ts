@@ -1,8 +1,7 @@
 import express, { type Request, type Response, type NextFunction } from 'express';
 import type { ChatCompletionRequest } from './types/api.js';
 import { Router } from './router/index.js';
-import { loadConfig } from './config/index.js';
-import { initDatabase, getDb } from './db/index.js';
+import { getDb } from './db/index.js';
 import { type RequestLogger } from './middleware/request-logger.js';
 
 export function createApp(router: Router, requestLogger?: RequestLogger) {

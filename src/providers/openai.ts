@@ -5,7 +5,7 @@ import type {
   ProviderHealth,
 } from '../types/api.js';
 import type { ProviderConfig } from '../config/index.js';
-import type { ProviderAdapter, RequestContext } from './base.js';
+import type { ProviderAdapter } from './base.js';
 
 export class OpenAIAdapter implements ProviderAdapter {
   name: string;

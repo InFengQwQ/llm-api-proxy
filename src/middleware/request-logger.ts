@@ -90,6 +90,50 @@ function resHeaders(res: Response): Record<string, string> {
   return sanitizeHeaders(h);
 }
 
+/**
+ * 从流式累积 chunk 中提取响应体 JSON
+ * - 优先取 res.json() 捕获的对象
+ * - 其次尝试从 SSE 流中解析最后一行 data
+ * - 兜底保存原始文本
+ */
+function extractResponseBody(chunks: Buffer[], jsonBody: unknown): unknown {
+  if (jsonBody !== undefined) return jsonBody;
+  if (chunks.length === 0) return null;
+
+  const raw = Buffer.concat(chunks).toString('utf-8');
+
+  // SSE 格式
+  if (raw.startsWith('data:') || raw.includes('\ndata:')) {
+    const dataLines = raw.split('\n')
+      .map(l => {
+        const trimmed = l.trimStart();
+        if (trimmed.startsWith('data:')) {
+          const payload = trimmed.slice(5).trim();
+          if (payload && payload !== '[DONE]') return payload;
+        }
+        return '';
+      })
+      .filter(Boolean);
+
+    if (dataLines.length > 0) {
+      // 策略1: 取最后一行 data（流式结束时的汇总 JSON，含 usage）
+      const lastLine = dataLines[dataLines.length - 1];
+      try { return JSON.parse(lastLine); } catch { /* fall through */ }
+
+      // 策略2: 拼接所有 data 行
+      try { return JSON.parse(dataLines.join('')); } catch { /* fall through */ }
+
+      // 策略3: 保存原始 SSE 文本
+      return { _raw_sse: raw, _data_lines: dataLines.length };
+    }
+    return { _raw_sse: raw, _note: 'no valid data lines' };
+  }
+
+  // 非 SSE 流式内容，截断避免过大
+  const truncated = raw.length > 5000 ? raw.slice(0, 5000) + '...(truncated)' : raw;
+  try { return JSON.parse(truncated); } catch { return { _raw_body: truncated }; }
+}
+
 // ---------- Logger 类 ----------
 
 export class RequestLogger {
@@ -141,22 +185,22 @@ export class RequestLogger {
       let resBodyObj: unknown = undefined;       // res.json() 传入的原始对象
       const resChunks: Buffer[] = [];             // res.write() 累积的流式数据
 
-      /** 统一处理各种可能的 chunk 类型 */
-      function pushChunk(chunk: unknown): void {
-        if (!chunk) return;
-        if (typeof chunk === 'string') {
-          resChunks.push(Buffer.from(chunk, 'utf-8'));
-        } else if (Buffer.isBuffer(chunk)) {
-          resChunks.push(chunk);
-        } else if (chunk instanceof Uint8Array) {
-          resChunks.push(Buffer.from(chunk));
-        } else if (chunk instanceof ArrayBuffer) {
-          resChunks.push(Buffer.from(chunk));
-        } else if (ArrayBuffer.isView(chunk)) {
-          // catch DataView / typed arrays
-          resChunks.push(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
-        }
-        // else: 非二进制/字符串类型，忽略
+/** 统一处理各种可能的 chunk 类型，统一转为 Buffer */
+function pushChunk(target: Buffer[], chunk: unknown): void {
+  if (!chunk) return;
+
+  if (typeof chunk === 'string') {
+    target.push(Buffer.from(chunk, 'utf-8'));
+  } else if (Buffer.isBuffer(chunk)) {
+    target.push(chunk);
+  } else if (chunk instanceof Uint8Array) {
+    target.push(Buffer.from(chunk));
+  } else if (chunk instanceof ArrayBuffer) {
+    target.push(Buffer.from(chunk));
+  } else if (ArrayBuffer.isView(chunk)) {
+    target.push(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+  }
+  // 非二进制/字符串类型，忽略
       }
 
       // 是否应捕获请求/响应体
@@ -173,7 +217,7 @@ export class RequestLogger {
       // 拦截 res.write — 累积流式响应块
       const originalWrite = res.write.bind(res) as typeof res.write;
       res.write = function (chunk: unknown, ...rest: unknown[]): boolean {
-        pushChunk(chunk);
+        pushChunk(resChunks, chunk);
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         return originalWrite(chunk as any, ...rest as any);
       };
@@ -183,7 +227,7 @@ export class RequestLogger {
       res.end = function (...args: Parameters<Response['end']>) {
         // res.end 可能携带最后一个 chunk（第一个参数）
         if (args.length > 0 && args[0] !== undefined) {
-          pushChunk(args[0]);
+          pushChunk(resChunks, args[0]);
         }
 
         const latency = Date.now() - start;
@@ -231,51 +275,7 @@ export class RequestLogger {
 
         // === 写入请求/响应体文件 ===
         if (shouldCapture) {
-          // 若有流式累积数据，尝试拼成 JSON 对象
-          if (resChunks.length > 0) {
-            const raw = Buffer.concat(resChunks).toString('utf-8');
-
-            // 判断是否为 SSE 格式
-            if (raw.startsWith('data:') || raw.includes('\ndata:')) {
-              // 提取所有 data: 行（支持 "data:" 和 "data: " 两种写法）
-              const dataLines = raw.split('\n')
-                .map(l => {
-                  const trimmed = l.trimStart();
-                  if (trimmed.startsWith('data:')) {
-                    const payload = trimmed.slice(5).trim(); // 去掉 "data:" 前缀
-                    if (payload && payload !== '[DONE]') return payload;
-                  }
-                  return '';
-                })
-                .filter(Boolean);
-
-              if (dataLines.length > 0) {
-                // 策略1: 取最后一行 data（流式结束时的汇总 JSON，含 usage）
-                const lastLine = dataLines[dataLines.length - 1];
-                try {
-                  resBodyObj = JSON.parse(lastLine);
-                } catch {
-                  // 策略2: 拼接所有 data 行
-                  try { resBodyObj = JSON.parse(dataLines.join('')); } catch {
-                    // 策略3: 保存原始 SSE 文本作为调试字段
-                    resBodyObj = { _raw_sse: raw, _data_lines: dataLines.length };
-                  }
-                }
-              } else {
-                // 有 SSE 包头但没有有效 data 行
-                resBodyObj = { _raw_sse: raw, _note: 'no valid data lines' };
-              }
-            } else {
-              // 非 SSE 的流式内容，保存原始文本（截断避免过大）
-              const truncated = raw.length > 5000 ? raw.slice(0, 5000) + '...(truncated)' : raw;
-              try {
-                resBodyObj = JSON.parse(truncated);
-              } catch {
-                resBodyObj = { _raw_body: truncated };
-              }
-            }
-          }
-
+          const resBody = extractResponseBody(resChunks, resBodyObj);
           const capture: BodyCapture = {
             request_id: requestId,
             timestamp: new Date().toISOString(),
@@ -289,7 +289,7 @@ export class RequestLogger {
               status: res.statusCode,
               latency_ms: latency,
               headers: resHeaders(res),
-              body: resBodyObj ?? null,
+              body: resBody,
             },
           };
 

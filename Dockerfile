@@ -17,6 +17,7 @@ RUN npm run build && npm prune --production
 # ============================================================
 FROM node:22-alpine
 ARG PORT
+ENV PORT=${PORT}
 EXPOSE ${PORT}
 
 RUN addgroup -S app && adduser -S app -G app

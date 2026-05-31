@@ -2,98 +2,81 @@
 
 统一 LLM API 代理网关——将多个 LLM Provider 聚合为单一端点，自动路由与故障切换。
 
-## 功能特性
+## 功能
 
-- **多 Provider 聚合**：支持 OpenAI、Anthropic、Ollama，可扩展更多 Provider
-- **统一模型命名**：`<provider>/<model_id>` 格式（如 `我的Claude/claude-sonnet-4-7`）
-- **自动故障切换**：熔断器模式，Provider 失败自动切换到下一个
-- **流式响应支持**：SSE 流式输出完整透传
-- **SQLite 请求日志**：持久化记录所有请求，支持审计查询
-- **OpenAI + Anthropic 双端点**：既可以用 `/v1/chat/completions`（OpenAI SDK），也可以用 `/v1/messages`（Anthropic SDK）
+- OpenAI、Anthropic、DeepSeek、Gemini、Ollama 多 Provider 支持
+- 熔断器 + 动态降权，Provider 不可用时自动切换
+- `auto:<group>` 路由组，多模型间自动 failover
+- SSE 流式响应透明转发
+- OpenAI `/v1/chat/completions` + Anthropic `/v1/messages` 双端点
+- SQLite 请求日志 + 文件日志（请求/响应体完整捕获）
+- 模型命名统一为 `<provider>/<model>` 格式
 
 ## 快速开始
 
 ```bash
-# 1. 复制配置
-cp config.example.yaml config.yaml
-
-# 2. 编辑 config.yaml，填入 API Key
-#    环境变量用 ${VAR_NAME} 语法，例如 ${OPENAI_API_KEY}
-
-# 3. 安装依赖
+cp config.example.yaml config.yaml    # 复制并填入 API Key
 npm install
-
-# 4. 开发模式运行
-npm run dev
-
-# 5. 生产构建
-npm run build && npm start
+npm run dev                           # 开发模式（热重载）
 ```
 
-## API 使用
-
-### OpenAI SDK 方式
+## API
 
 ```python
 from openai import OpenAI
 
-client = OpenAI(
-    api_key="sk-dummy",           # 任意值，本地代理不需要真实 key
-    base_url="http://localhost:3000/v1"
-)
-
-response = client.chat.completions.create(
-    model="我的Claude/claude-sonnet-4-7",  # 格式: <provider名>/<模型名>
-    messages=[{"role": "user", "content": "Hello!"}]
+client = OpenAI(base_url="http://localhost:8348/v1", api_key="sk-dummy")
+client.chat.completions.create(
+    model="OpenRouter/deepseek/deepseek-v4-flash:free",
+    messages=[{"role": "user", "content": "Hello"}]
 )
 ```
-
-### Anthropic SDK 方式
-
-```python
-import anthropic
-
-client = anthropic.Anthropic(
-    api_key="sk-dummy",
-    base_url="http://localhost:3000/v1/messages"
-)
-# 注意：使用 /v1/messages 端点
-```
-
-### 模型列表
 
 ```bash
-curl http://localhost:3000/v1/models
+curl http://localhost:8348/v1/models          # 模型列表
+curl http://localhost:8348/health             # 健康检查
 ```
 
-### 健康检查
+## 管理端点
 
-```bash
-curl http://localhost:3000/health
-```
+| 端点 | 说明 |
+|------|------|
+| `GET /admin/providers` | Provider 列表及熔断器状态 |
+| `GET /admin/providers/:name/health` | 单个 Provider 健康详情 |
+| `GET /admin/auto-routing` | Auto 路由组列表 |
+| `GET /admin/auto-routing/heat` | 模型热度降权状态 |
+| `GET /admin/logs?limit=100&provider=xxx` | 请求日志查询 |
 
-## 配置说明
+## 配置
 
 ```yaml
 providers:
-  - name: "我的Claude"        # 任意起的名字，出现在模型名前缀中
-    type: anthropic           # openai | anthropic | ollama
-    api_key: "${API_KEY}"     # 支持环境变量
-    models:
-      - claude-sonnet-4-7
-      - claude-haiku-4-5
+  - name: "OpenRouter"
+    type: openai
+    api_key: "${OPENROUTER_API_KEY}"
+    base_url: "https://openrouter.ai/api/v1"
+    models: [deepseek/deepseek-v4-flash:free]
     circuit_breaker:
-      failure_threshold: 3    # 连续失败 N 次后断路
-      recovery_timeout: 30    # 每 30 秒探测一次恢复
+      failure_threshold: 3
+      recovery_timeout: 30
+
+auto_routing:                        # 可选：多模型自动 failover
+  default:
+    targets:
+      - "OpenRouter/deepseek/deepseek-v4-flash:free"
+      - "NVIDIA/minimaxai/minimax-m2.7"
 ```
 
-## Docker 部署
+## Docker
 
 ```bash
-docker-compose up --build
+docker compose up --build
 ```
 
-## 管理接口
+## 开发
 
-- `GET /admin/providers` — 查看所有 Provider 状态和熔断器状态
-- `GET /admin/logs?limit=100&provider=我的Claude` — 查询请求日志
+```bash
+npm run build    # tsc 编译
+npm test         # vitest
+npm run lint     # tsc --noEmit 类型检查
+```

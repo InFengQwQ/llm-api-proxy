@@ -301,9 +301,7 @@ export class Router {
   ): ReadableStream<Uint8Array> {
     const encoder = new TextEncoder();
     const iterator = entry.adapter.sendStreaming(request);
-
     let finished = false;
-    let iteratorResult: IteratorResult<{ id: string; object: string; created: number; model: string; choices: Array<{ index: number; delta: Record<string, unknown>; finish_reason?: string }> }>;
 
     return new ReadableStream<Uint8Array>({
       async pull(controller) {
@@ -318,7 +316,6 @@ export class Router {
           controller.close();
           return;
         }
-        iteratorResult = { value, done: false };
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
       },
       async cancel(err: unknown) {
@@ -384,7 +381,7 @@ export class Router {
 }
 
 // ---------------------------------------------------------------------------
-// 日志批量写入
+// 批量日志写入（模块级缓冲，减少 SQLite 写入频率）
 // ---------------------------------------------------------------------------
 
 interface PendingLog {
@@ -412,17 +409,18 @@ function logRequestAsync(
 
 function flushLogs(): void {
   if (!pendingLogs.length) return;
-  const logs = pendingLogs.splice(0);
-  for (const l of logs) {
+  const batch = pendingLogs.splice(0);
+  for (const log of batch) {
     logRequest({
-      request_id: l.requestId,
-      model: l.model,
-      provider: l.provider,
-      latency_ms: l.latency,
-      status_code: l.status,
-      error_msg: l.error,
+      request_id: log.requestId,
+      model: log.model,
+      provider: log.provider,
+      latency_ms: log.latency,
+      status_code: log.status,
+      error_msg: log.error,
     });
   }
 }
 
-setInterval(flushLogs, 5000);
+// 每 5 秒定时刷盘，防止尾部日志丢失
+setInterval(flushLogs, 5_000);

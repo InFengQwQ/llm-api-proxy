@@ -2,12 +2,20 @@ import type {
   ChatCompletionRequest,
   ChatCompletionResponse,
   StreamChunk,
-  AnthropicMessageRequest,
   AnthropicMessageResponse,
   ProviderHealth,
 } from '../types/api.js';
 import type { ProviderConfig } from '../config/index.js';
 import type { ProviderAdapter } from './base.js';
+
+// Anthropic content block type
+type ContentBlock = {
+  type: 'text' | 'tool_use';
+  text?: string;
+  id?: string;
+  name?: string;
+  input?: Record<string, unknown>;
+};
 
 export class AnthropicAdapter implements ProviderAdapter {
   name: string;
@@ -76,7 +84,7 @@ export class AnthropicAdapter implements ProviderAdapter {
     resp: AnthropicMessageResponse,
     model: string
   ): ChatCompletionResponse {
-    const parts = resp.content.map((block: { type: 'text' | 'tool_use'; text?: string; id?: string; name?: string; input?: Record<string, unknown> }) => {
+    const parts = resp.content.map((block: ContentBlock) => {
       if (block.type === 'text') {
         return { role: 'assistant' as const, content: block.text ?? '' };
       }
@@ -121,23 +129,21 @@ export class AnthropicAdapter implements ProviderAdapter {
     };
   }
 
-  private mergeMessages(parts: Array<{ role: string; content: string | null; tool_calls?: unknown[] }>) {
+  private mergeMessages(
+    parts: Array<{ role: string; content: string | null; tool_calls?: unknown[] }>
+  ): ChatCompletionResponse['choices'][0]['message'] {
     const contentParts: string[] = [];
     const toolCalls: unknown[] = [];
 
     for (const p of parts) {
-      if (p.tool_calls?.length) {
-        toolCalls.push(...p.tool_calls);
-      }
-      if (p.content) {
-        contentParts.push(p.content);
-      }
+      if (p.tool_calls?.length) toolCalls.push(...p.tool_calls);
+      if (p.content) contentParts.push(p.content);
     }
 
     return {
-      role: 'assistant' as const,
+      role: 'assistant',
       content: contentParts.join('\n') || null,
-      tool_calls: toolCalls.length ? toolCalls as ChatCompletionResponse['choices'][0]['message']['tool_calls'] : undefined,
+      tool_calls: toolCalls.length > 0 ? toolCalls as ChatCompletionResponse['choices'][0]['message']['tool_calls'] : undefined,
     };
   }
 
