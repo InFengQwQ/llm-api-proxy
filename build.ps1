@@ -1,9 +1,11 @@
-<#.SYNOPSIS
+<#
+.SYNOPSIS
   Build & deploy the LLM API Proxy via Docker Compose.
 .DESCRIPTION
-  1. Parse port from config.yaml (server section only).
-  2. Kill any process occupying the target port.
-  3. Rebuild the image and start the container.
+  1. Kill any lingering tsx/node processes from this project.
+  2. Parse port from config.yaml (server section only).
+  3. Kill any process occupying the target port.
+  4. Rebuild the image and start the container (guarantees exactly 1).
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -18,6 +20,18 @@ if ($config -notmatch '(?s)server:.*?port:\s*(\d+)') {
 }
 $port = $matches[1]
 Write-Host "Target port: $port"
+
+# ----- Kill any lingering tsx/node processes from this project -----
+$projectDir = (Get-Item $PSScriptRoot).FullName
+Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | ForEach-Object {
+  $cmd = $_.CommandLine
+  if ($cmd -and $cmd -match [regex]::Escape($projectDir) -and $cmd -match 'tsx|index\.ts') {
+    if ($_.ProcessId -ne $PID) {
+      Write-Host "Killing stale project process (PID $($_.ProcessId))"
+      Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
 
 # ----- Kill any process occupying the target port -----
 $pidOnPort = (Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue).OwningProcess |
@@ -35,7 +49,7 @@ foreach ($id in $pidOnPort) {
 "PORT=$port" | Set-Content "$PSScriptRoot\.env"
 
 Write-Host 'Stopping old containers...'
-docker compose down --remove-orphans 2>$null
+cmd /c "docker compose down --remove-orphans 2>nul" | Out-Null
 
 Write-Host 'Building image...'
 docker compose build --no-cache

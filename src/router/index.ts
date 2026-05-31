@@ -1,4 +1,4 @@
-import type { ChatCompletionRequest } from '../types/api.js';
+import type { ChatCompletionRequest, StreamChunk } from '../types/api.js';
 import type { ProviderConfig, AutoRoutingConfig } from '../config/index.js';
 import type { ProviderAdapter } from '../providers/base.js';
 import { createAdapter, parseModelId } from '../providers/index.js';
@@ -267,15 +267,32 @@ export class Router {
 
     try {
       if (request.stream) {
-        const body = this.streamToReadableStream(entry, modifiedRequest, target, provider_name, requestId);
-        return new Response(body, {
-          headers: {
-            'Content-Type': 'text/event-stream; charset=utf-8',
-            'Cache-Control': 'no-cache',
-            'X-Provider': provider_name,
-            'X-Auto-Target': target,
-          },
-        });
+        // 先取第一个 chunk 验证上游健康；失败则返回错误状态码让 auto 路由层重试
+        const iterator = entry.adapter.sendStreaming(modifiedRequest);
+        try {
+          const firstResult = await iterator.next();
+          if (firstResult.done) {
+            entry.breaker.recordFailure();
+            logRequestAsync(requestId, target, provider_name, Date.now() - startTime, 502, 'Empty stream');
+            return Response.json({ error: { message: 'Empty upstream stream', type: 'upstream_error' } }, { status: 502 });
+          }
+          const body = this.streamToReadableStream(entry, modifiedRequest, target, provider_name, requestId, iterator, firstResult.value);
+          return new Response(body, {
+            headers: {
+              'Content-Type': 'text/event-stream; charset=utf-8',
+              'Cache-Control': 'no-cache',
+              'X-Provider': provider_name,
+              'X-Auto-Target': target,
+            },
+          });
+        } catch (err) {
+          entry.breaker.recordFailure();
+          const latency = Date.now() - startTime;
+          const errorMsg = err instanceof Error ? err.message : String(err);
+          const status = errorMsg.includes('429') ? 429 : 502;
+          logRequestAsync(requestId, target, provider_name, latency, status, errorMsg);
+          return Response.json({ error: { message: errorMsg, type: 'upstream_error' } }, { status });
+        }
       }
 
       const result = await entry.adapter.send(modifiedRequest);
@@ -297,26 +314,49 @@ export class Router {
     request: ChatCompletionRequest,
     modelId: string,
     providerName: string,
-    requestId: string
+    requestId: string,
+    iterator?: AsyncGenerator<StreamChunk>,
+    headChunk?: StreamChunk
   ): ReadableStream<Uint8Array> {
     const encoder = new TextEncoder();
-    const iterator = entry.adapter.sendStreaming(request);
+    const iter = iterator ?? entry.adapter.sendStreaming(request);
     let finished = false;
+    let headEmitted = headChunk === undefined;
 
     return new ReadableStream<Uint8Array>({
       async pull(controller) {
-        const { value, done } = await iterator.next();
-        if (done) {
+        try {
+          // 先发送预取的首个 chunk
+          if (!headEmitted && headChunk !== undefined) {
+            headEmitted = true;
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(headChunk)}\n\n`));
+            return;
+          }
+
+          const { value, done } = await iter.next();
+          if (done) {
+            if (!finished) {
+              finished = true;
+              entry.breaker.recordSuccess();
+              logRequestAsync(requestId, modelId, providerName, 0, 200);
+            }
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+            controller.close();
+            return;
+          }
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
+        } catch (err) {
+          // 流中途失败：记录故障、发送 SSE error 事件并正常关闭
           if (!finished) {
             finished = true;
-            entry.breaker.recordSuccess();
-            logRequestAsync(requestId, modelId, providerName, 0, 200);
+            const errorMsg = err instanceof Error ? err.message : String(err);
+            entry.breaker.recordFailure();
+            logRequestAsync(requestId, modelId, providerName, 0, 502, errorMsg);
           }
+          controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: 'upstream stream failed' })}\n\n`));
           controller.enqueue(encoder.encode('data: [DONE]\n\n'));
           controller.close();
-          return;
         }
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
       },
       async cancel(err: unknown) {
         if (!finished) {
@@ -325,7 +365,7 @@ export class Router {
           entry.breaker.recordFailure();
           logRequestAsync(requestId, modelId, providerName, 0, 499, errorMsg);
         }
-        void iterator.return(undefined);
+        void iter.return(undefined);
       },
     });
   }

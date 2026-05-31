@@ -10,7 +10,8 @@
     "start": "node dist/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "docker": "powershell -File build.ps1"
   },
   "dependencies": {
     "express": "^4.21.2",

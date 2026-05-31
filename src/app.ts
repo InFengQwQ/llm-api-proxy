@@ -50,7 +50,8 @@ export function createApp(router: Router, requestLogger?: RequestLogger) {
               if (done) { res.end(); break; }
               res.write(value);
             }
-          } catch {
+          } catch (err) {
+            console.error(`[gateway] stream read error: ${err instanceof Error ? err.message : String(err)}`);
             res.end();
           }
         };
@@ -107,7 +108,8 @@ export function createApp(router: Router, requestLogger?: RequestLogger) {
               if (done) { res.end(); break; }
               res.write(value);
             }
-          } catch {
+          } catch (err) {
+            console.error(`[gateway] stream read error: ${err instanceof Error ? err.message : String(err)}`);
             res.end();
           }
         };
