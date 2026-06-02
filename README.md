@@ -4,13 +4,11 @@
 
 ## 功能
 
-- OpenAI、Anthropic、DeepSeek、Gemini、Ollama 多 Provider 支持
-- 熔断器 + 动态降权，Provider 不可用时自动切换
-- `auto:<group>` 路由组，多模型间自动 failover
-- SSE 流式响应透明转发
-- OpenAI `/v1/chat/completions` + Anthropic `/v1/messages` 双端点
-- SQLite 请求日志 + 文件日志（请求/响应体完整捕获）
-- 模型命名统一为 `<provider>/<model>` 格式
+- **5 类 API 协议**：OpenAI Chat Completions / Responses、Anthropic Messages、Google Gemini、Ollama
+- **Multi-Protocol 自动探测**：`type: [openai, anthropic, ...]` 或 `type: auto`，首次请求自动缓存正确协议
+- **熔断器 + 动态降权**：连续失败 N 次熔断，定期探测恢复；429 触发热度冷却
+- **`auto:<group>` 路由组**：多模型 failover + 会话粘性（同 session_id 尽量路由到同一模型）
+- **5 标准入口**：`/v1/chat/completions` · `/v1/messages` · `/v1/responses` · `/v1beta/models/...` · `/api/chat`
 
 ## 快速开始
 
@@ -22,15 +20,55 @@ npm run dev                           # 开发模式（热重载）
 
 ## API
 
+### OpenAI 兼容端点
+
 ```python
 from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8348/v1", api_key="sk-dummy")
+
+# 直连模型
 client.chat.completions.create(
     model="OpenRouter/deepseek/deepseek-v4-flash:free",
     messages=[{"role": "user", "content": "Hello"}]
 )
+
+# Auto 路由组（自动 failover）
+client.chat.completions.create(
+    model="auto:free",
+    messages=[{"role": "user", "content": "Hello"}]
+)
+
+# 流式
+for chunk in client.chat.completions.create(
+    model="auto:free",
+    messages=[{"role": "user", "content": "Hello"}],
+    stream=True
+):
+    print(chunk.choices[0].delta.content or "", end="")
 ```
+
+### 其他协议原生端点
+
+```bash
+# Anthropic
+curl http://localhost:8348/v1/messages -H "Content-Type: application/json" \
+  -d '{"model":"auto:free","max_tokens":4096,"messages":[{"role":"user","content":"Hello"}]}'
+
+# Google Gemini
+curl http://localhost:8348/v1beta/models/auto:free:generateContent -H "Content-Type: application/json" \
+  -d '{"contents":[{"parts":[{"text":"Hello"}]}]}'
+
+# Ollama
+curl http://localhost:8348/api/chat -H "Content-Type: application/json" \
+  -d '{"model":"auto:free","messages":[{"role":"user","content":"Hello"}]}'
+
+# OpenAI Responses
+curl http://localhost:8348/v1/responses -H "Content-Type: application/json" \
+  -d '{"model":"auto:free","input":"Hello"}'
+```
+
+### 通用端点
 
 ```bash
 curl http://localhost:8348/v1/models          # 模型列表
@@ -47,36 +85,75 @@ curl http://localhost:8348/health             # 健康检查
 | `GET /admin/auto-routing/heat` | 模型热度降权状态 |
 | `GET /admin/logs?limit=100&provider=xxx` | 请求日志查询 |
 
+## 模型命名
+
+| 格式 | 示例 |
+|------|------|
+| `<provider>/<model_id>` | `OpenRouter/deepseek/deepseek-v4-flash:free` |
+| `auto:<group>` | `auto:free` |
+| `auto:<group>/<sessionId>` | `auto:free/my-session-123` |
+
 ## 配置
 
 ```yaml
+server:
+  port: 8348
+
 providers:
   - name: "OpenRouter"
     type: openai
     api_key: "${OPENROUTER_API_KEY}"
-    base_url: "https://openrouter.ai/api/v1"
-    models: [deepseek/deepseek-v4-flash:free]
-    circuit_breaker:
-      failure_threshold: 3
-      recovery_timeout: 30
+    base_url: "https://openrouter.ai/api"
 
-auto_routing:                        # 可选：多模型自动 failover
-  default:
+  - name: "OpenCode"                        # 多协议自动探测
+    type: [openai, anthropic, google, openai_responses]
+    api_key: "${OPENCODE_API_KEY}"
+    base_url: "https://opencode.ai/zen"
+
+auto_routing:
+  - name: free
     targets:
       - "OpenRouter/deepseek/deepseek-v4-flash:free"
-      - "NVIDIA/minimaxai/minimax-m2.7"
+      - "OpenRouter/qwen/qwen3-coder:free"
+```
+
+`${VAR_NAME}` 自动替换为环境变量。`base_url` 填服务根地址（不含 API 版本路径）。
+
+### Provider 类型
+
+| type | 协议 | 端点 |
+|------|------|------|
+| `openai` | OpenAI Chat Completions | `/v1/chat/completions` |
+| `openai_responses` | OpenAI Responses API | `/v1/responses` |
+| `anthropic` | Anthropic Messages | `/v1/messages` |
+| `google` | Google Gemini | `/v1beta/models/{model}:generateContent` |
+| `ollama` | Ollama Chat | `/api/chat` |
+| `auto` / `[openai, anthropic, ...]` | 自动探测 / 按顺序尝试 | — |
+
+### Auto 路由行为
+
+```
+请求 model="auto:free" 时：
+ 1. 会话粘性：同 sessionId 优先复用上次成功的模型
+ 2. 按 targets 顺序找第一个 熔断闭合 + 未过热的模型
+ 3. 429 → 标记过热（60s 冷却），切下一个
+ 4. 502/网络错误 → 记录失败，切下一个
+ 5. 全部不可用 → 503
 ```
 
 ## Docker
 
 ```bash
-docker compose up --build
+docker compose up --build        # 或 .\build.ps1
 ```
+
+挂载：`./config.yaml`（只读）· `./data/` · `./logs/`
 
 ## 开发
 
 ```bash
-npm run build    # tsc 编译
-npm test         # vitest
-npm run lint     # tsc --noEmit 类型检查
+npm run dev       # tsx watch 热重载
+npm run build     # tsc 编译
+npm test          # vitest 单元测试
+npm run lint      # tsc --noEmit 类型检查
 ```

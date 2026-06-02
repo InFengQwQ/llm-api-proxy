@@ -32,6 +32,8 @@ export interface ChatCompletionRequest {
   presence_penalty?: number;
   frequency_penalty?: number;
   user?: string;
+  /** 协议特有参数透传（入口无法映射到 CCR 的字段暂存于此） */
+  provider_options?: Record<string, unknown>;
 }
 
 export interface ToolDefinition {
@@ -76,6 +78,7 @@ export interface StreamChunk {
     delta: {
       role?: 'assistant';
       content?: string | null;
+      reasoning_content?: string | null;
       tool_calls?: Array<{
         index: number;
         id?: string;
@@ -93,25 +96,29 @@ export interface StreamChunk {
 
 // Anthropic Messages API 类型
 
-export interface AnthropicMessageRequest {
-  model: string; // 格式: <provider>/<model_id>
+/** Anthropic Messages 入口原生请求体 */
+export interface AnthropicRequest {
+  model: string;
   messages: Array<{
     role: 'user' | 'assistant';
-    content: string | Array<{ type: string; [key: string]: unknown }>;
+    content: string | Array<AnthropicContentBlock>;
   }>;
-  system?: string | Array<{ type: string; text?: string; [key: string]: unknown }>;
+  system?: string | Array<{ type: 'text'; text: string }>;
   max_tokens: number;
   temperature?: number;
   top_p?: number;
-  tools?: Array<{
-    name: string;
-    description?: string;
-    input_schema: Record<string, unknown>;
-  }>;
+  stop_sequences?: string[];
+  tools?: Array<{ name: string; description?: string; input_schema: Record<string, unknown> }>;
   tool_choice?: { type: 'auto' | 'any' | 'tool'; name?: string };
+  thinking?: { type: 'enabled'; budget_tokens: number };
   stream?: boolean;
-  metadata?: { user_id?: string };
 }
+
+export type AnthropicContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+  | { type: 'tool_result'; tool_use_id: string; content: string | Array<{ type: string; text?: string }> }
+  | { type: 'thinking'; thinking: string };
 
 export interface AnthropicMessageResponse {
   id: string;
@@ -133,6 +140,68 @@ export interface AnthropicMessageResponse {
   };
 }
 
+// ===== Google Gemini 原生类型 =====
+
+export interface GoogleRequest {
+  contents: Array<{ role: 'user' | 'model'; parts: Array<{ text?: string }> }>;
+  systemInstruction?: { parts: Array<{ text: string }> };
+  generationConfig?: {
+    temperature?: number;
+    topP?: number;
+    maxOutputTokens?: number;
+    stopSequences?: string[];
+  };
+  safetySettings?: Array<{ category: string; threshold: string }>;
+}
+
+export interface GoogleResponse {
+  candidates?: Array<{
+    content?: { parts?: Array<{ text?: string }>; role?: string };
+    finishReason?: string;
+  }>;
+  usageMetadata?: {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    totalTokenCount?: number;
+  };
+}
+
+// ===== Ollama 原生类型 =====
+
+export interface OllamaRequest {
+  model: string;
+  messages: Array<{ role: string; content: string }>;
+  stream?: boolean;
+  options?: {
+    temperature?: number;
+    top_p?: number;
+    num_predict?: number;
+    stop?: string[];
+  };
+}
+
+export interface OllamaResponse {
+  model: string;
+  message: { role: string; content: string };
+  done: boolean;
+  total_duration?: number;
+}
+
+// ===== OpenAI Responses 原生类型 =====
+
+export interface ResponsesRequest {
+  model: string;
+  input: string | Array<{ role: string; content: string }>;
+  instructions?: string;
+  temperature?: number;
+  max_output_tokens?: number;
+  top_p?: number;
+  stream?: boolean;
+  previous_response_id?: string;
+  text?: { format?: { type: 'text' | 'json_object' | 'json_schema'; name?: string; schema?: Record<string, unknown> } };
+  tools?: Array<{ type: 'function'; name: string; description?: string; parameters?: Record<string, unknown> }>;
+}
+
 // 模型列表
 export interface ModelInfo {
   id: string; // <provider>/<model_id>
@@ -140,7 +209,7 @@ export interface ModelInfo {
   created: number;
   owned_by: string;
   provider: string; // 配置中的 provider 别名
-  provider_type: string; // openai / anthropic / ollama / gemini
+  provider_type: string; // openai / anthropic / ollama / google
   model_id: string; // provider 端的实际模型名
 }
 
@@ -150,4 +219,15 @@ export interface ProviderHealth {
   status: 'healthy' | 'degraded' | 'unavailable';
   latency_ms: number;
   error_rate: number;
+}
+
+export class ProviderApiError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+    public payload?: unknown
+  ) {
+    super(message);
+    this.name = 'ProviderApiError';
+  }
 }

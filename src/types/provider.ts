@@ -2,12 +2,7 @@
 // Provider 相关类型
 // =============================================================================
 
-export type ProviderType = 'openai' | 'anthropic' | 'deepseek' | 'gemini' | 'ollama';
+export type ProviderType = 'openai' | 'anthropic' | 'google' | 'ollama' | 'openai_responses';
 
-export type ProviderCapability = 'chat' | 'streaming' | 'tools';
-
-// 路由决策结果
-export interface RouteResult {
-  provider_name: string;
-  model_id: string;
-}
+// 多协议提供商的 type 可以是数组或 'auto'
+export type ProviderTypeConfig = ProviderType | ProviderType[] | 'auto';

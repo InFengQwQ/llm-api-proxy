@@ -1,6 +1,7 @@
 services:
   llm-api-proxy:
     container_name: llm-api-proxy
+    image: llm-api-proxy:latest
     build:
       context: .
       dockerfile: Dockerfile

@@ -1,5 +1,6 @@
 import type { ChatCompletionRequest, StreamChunk } from '../types/api.js';
-import type { ProviderConfig, AutoRoutingConfig } from '../config/index.js';
+import { ProviderApiError } from '../types/api.js';
+import type { ProviderConfig, AutoRoutingConfig, AutoRoutingGroup } from '../config/index.js';
 import type { ProviderAdapter } from '../providers/base.js';
 import { createAdapter, parseModelId } from '../providers/index.js';
 import { CircuitBreaker } from './circuit-breaker.js';
@@ -18,10 +19,17 @@ type SessionMap = Map<string, { target: string; boundAt: number }>;
 
 export class Router {
   private providers = new Map<string, ProviderEntry>();
-  private autoRouting: AutoRoutingConfig = {};
+  private autoRouting: AutoRoutingConfig = [];
+  /** auto 路由组查找表：group.name → group */
+  private autoRoutingMap = new Map<string, AutoRoutingGroup>();
   private modelHeat: ModelHeatMap = new Map();
   private sessionMap: SessionMap = new Map();
   private sessionTtl = 10 * 60 * 1000; // 10 分钟会话粘性 TTL
+  private pruneIntervalId: ReturnType<typeof setInterval> | null = null;
+
+  /** 模型列表缓存：provider_name -> { models, fetchedAt } */
+  private modelCache = new Map<string, { models: string[]; fetchedAt: number }>();
+  private modelCacheTtl = 5 * 60 * 1000; // 5 分钟缓存
 
   register(configs: ProviderConfig[]): void {
     for (const config of configs) {
@@ -33,7 +41,15 @@ export class Router {
       });
     }
     // 启动 session TTL 清理
-    setInterval(() => this.pruneExpiredSessions(), this.sessionTtl);
+    this.pruneIntervalId = setInterval(() => this.pruneExpiredSessions(), this.sessionTtl);
+  }
+
+  /** 清理定时器（用于优雅关闭） */
+  destroy(): void {
+    if (this.pruneIntervalId !== null) {
+      clearInterval(this.pruneIntervalId);
+      this.pruneIntervalId = null;
+    }
   }
 
   private pruneExpiredSessions(): void {
@@ -47,6 +63,49 @@ export class Router {
 
   registerAutoRouting(config: AutoRoutingConfig): void {
     this.autoRouting = config;
+    this.autoRoutingMap.clear();
+    for (const group of config) {
+      this.autoRoutingMap.set(group.name, group);
+    }
+  }
+
+  /** 从 Provider 的 /models 端点拉取模型列表，结果写入缓存 */
+  async fetchProviderModels(providerName: string): Promise<string[]> {
+    const entry = this.providers.get(providerName);
+    if (!entry) return [];
+
+    // 如果配置明确关闭了动态拉取，只返回静态列表
+    if (entry.config.fetch_models === false) {
+      return entry.config.models ?? [];
+    }
+
+    const cached = this.modelCache.get(providerName);
+    if (cached && Date.now() - cached.fetchedAt < this.modelCacheTtl) {
+      return cached.models;
+    }
+
+    try {
+      const models = await entry.adapter.fetchModels();
+      if (models.length > 0) {
+        this.modelCache.set(providerName, { models, fetchedAt: Date.now() });
+      }
+      return models;
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.warn(`[router] Failed to fetch models from ${providerName}: ${errMsg}`);
+      return [];
+    }
+  }
+
+  /** 刷新所有 Provider 的模型列表（启动时调用，不阻塞） */
+  refreshAllModels(): void {
+    for (const [name] of this.providers) {
+      this.fetchProviderModels(name).then(models => {
+        console.log(`[router] ${name}: ${models.length} models fetched`);
+      }).catch(() => {
+        // fetchProviderModels 内部已处理错误
+      });
+    }
   }
 
   /** 解析 auto 模型名：auto:<group> 或 auto:<group>/<sessionId> */
@@ -102,6 +161,14 @@ export class Router {
     } catch {
       return null;
     }
+  }
+
+  /** Extract appropriate HTTP status from an error, defaulting to 502 */
+  private errorStatus(err: unknown): number {
+    if (err instanceof ProviderApiError) return err.status;
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('429')) return 429;
+    return 502;
   }
 
   private isModelOverheated(target: string): boolean {
@@ -186,7 +253,7 @@ export class Router {
       entry.breaker.recordFailure();
       const latency = Date.now() - startTime;
       const errorMsg = err instanceof Error ? err.message : String(err);
-      const status = errorMsg.includes('429') ? 429 : 502;
+      const status = this.errorStatus(err);
       logRequestAsync(requestId, fullModelId, provider_name, latency, status, errorMsg);
       return Response.json({ error: { message: errorMsg, type: 'upstream_error' } }, { status });
     }
@@ -198,7 +265,7 @@ export class Router {
     requestId: string,
     sessionId?: string
   ): Promise<Response> {
-    const groupConfig = this.autoRouting[group];
+    const groupConfig = this.autoRoutingMap.get(group);
     if (!groupConfig) {
       return Response.json(
         { error: { message: `Auto routing group "${group}" not found`, type: 'invalid_request_error' } },
@@ -289,7 +356,7 @@ export class Router {
           entry.breaker.recordFailure();
           const latency = Date.now() - startTime;
           const errorMsg = err instanceof Error ? err.message : String(err);
-          const status = errorMsg.includes('429') ? 429 : 502;
+          const status = this.errorStatus(err);
           logRequestAsync(requestId, target, provider_name, latency, status, errorMsg);
           return Response.json({ error: { message: errorMsg, type: 'upstream_error' } }, { status });
         }
@@ -303,7 +370,7 @@ export class Router {
       entry.breaker.recordFailure();
       const latency = Date.now() - startTime;
       const errorMsg = err instanceof Error ? err.message : String(err);
-      const status = errorMsg.includes('429') ? 429 : 502;
+      const status = this.errorStatus(err);
       logRequestAsync(requestId, target, provider_name, latency, status, errorMsg);
       return Response.json({ error: { message: errorMsg, type: 'upstream_error' } }, { status });
     }
@@ -356,13 +423,13 @@ export class Router {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
         } catch (err) {
           // 流中途失败：记录故障、发送 SSE error 事件并正常关闭
+          const errorMsg = err instanceof Error ? err.message : String(err);
           if (!finished) {
             finished = true;
-            const errorMsg = err instanceof Error ? err.message : String(err);
             entry.breaker.recordFailure();
             logRequestAsync(requestId, modelId, providerName, 0, 502, errorMsg);
           }
-          controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: 'upstream stream failed' })}\n\n`));
+          controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: errorMsg })}\n\n`));
           controller.enqueue(encoder.encode('data: [DONE]\n\n'));
           controller.close();
         }
@@ -379,10 +446,20 @@ export class Router {
     });
   }
 
+  /** 获取某 Provider 当前有效的模型数量（优先缓存，其次 config） */
+  private getModelCount(providerName: string): number {
+    const entry = this.providers.get(providerName);
+    if (!entry) return 0;
+    if (entry.config.fetch_models === false) {
+      return entry.config.models?.length ?? 0;
+    }
+    return this.modelCache.get(providerName)?.models.length ?? 0;
+  }
+
   getProviderHealth(providerName: string) {
     const entry = this.providers.get(providerName);
     if (!entry) return null;
-    return { provider: providerName, state: entry.breaker.getState(), model_count: entry.config.models.length };
+    return { provider: providerName, state: entry.breaker.getState(), model_count: this.getModelCount(providerName) };
   }
 
   listProviders() {
@@ -390,7 +467,7 @@ export class Router {
       name,
       type: entry.config.type,
       enabled: entry.config.enabled,
-      model_count: entry.config.models.length,
+      model_count: this.getModelCount(name),
       breaker_state: entry.breaker.getState(),
     }));
   }
@@ -398,23 +475,46 @@ export class Router {
   getAllModels() {
     const models: Array<{ id: string; object: string; created: number; owned_by: string; provider: string; provider_type: string }> = [];
     for (const [providerName, entry] of this.providers) {
-      for (const modelId of entry.config.models) {
+      let modelIds: string[];
+      if (entry.config.fetch_models === false) {
+        // 用户明确关闭了动态拉取，使用 config 中静态指定的列表
+        modelIds = entry.config.models ?? [];
+      } else {
+        // 仅从缓存读取（启动时异步预热，失败则空）
+        modelIds = this.modelCache.get(providerName)?.models ?? [];
+      }
+      // normalize type for display: arrays get joined, 'auto' stays as-is
+      const typeDisplay = Array.isArray(entry.config.type)
+        ? entry.config.type.join(',')
+        : entry.config.type;
+      for (const modelId of modelIds) {
         models.push({
           id: `${providerName}/${modelId}`,
           object: 'model',
           created: 1700000000,
-          owned_by: entry.config.type,
+          owned_by: typeDisplay,
           provider: providerName,
-          provider_type: entry.config.type,
+          provider_type: typeDisplay,
         });
       }
+    }
+    // 追加 auto: 路由组
+    for (const group of this.autoRouting) {
+      models.push({
+        id: `auto:${group.name}`,
+        object: 'model',
+        created: 1700000000,
+        owned_by: 'auto',
+        provider: 'auto',
+        provider_type: 'auto',
+      });
     }
     return models;
   }
 
   listAutoRoutingGroups(): Array<{ name: string; target_count: number; targets: string[] }> {
-    return Object.entries(this.autoRouting).map(([name, group]) => ({
-      name,
+    return this.autoRouting.map(group => ({
+      name: group.name,
       target_count: group.targets.length,
       targets: group.targets,
     }));
@@ -472,4 +572,10 @@ function flushLogs(): void {
 }
 
 // 每 5 秒定时刷盘，防止尾部日志丢失
-setInterval(flushLogs, 5_000);
+const flushIntervalId = setInterval(flushLogs, 5_000);
+
+/** 停止批量日志刷盘定时器（用于优雅关闭） */
+export function stopFlushInterval(): void {
+  clearInterval(flushIntervalId);
+  flushLogs(); // 最后再刷一次，确保尾部日志不丢失
+}

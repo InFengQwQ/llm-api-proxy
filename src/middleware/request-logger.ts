@@ -185,22 +185,22 @@ export class RequestLogger {
       let resBodyObj: unknown = undefined;       // res.json() 传入的原始对象
       const resChunks: Buffer[] = [];             // res.write() 累积的流式数据
 
-/** 统一处理各种可能的 chunk 类型，统一转为 Buffer */
-function pushChunk(target: Buffer[], chunk: unknown): void {
-  if (!chunk) return;
+      /** 统一处理各种可能的 chunk 类型，统一转为 Buffer */
+      function pushChunk(target: Buffer[], chunk: unknown): void {
+        if (!chunk) return;
 
-  if (typeof chunk === 'string') {
-    target.push(Buffer.from(chunk, 'utf-8'));
-  } else if (Buffer.isBuffer(chunk)) {
-    target.push(chunk);
-  } else if (chunk instanceof Uint8Array) {
-    target.push(Buffer.from(chunk));
-  } else if (chunk instanceof ArrayBuffer) {
-    target.push(Buffer.from(chunk));
-  } else if (ArrayBuffer.isView(chunk)) {
-    target.push(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
-  }
-  // 非二进制/字符串类型，忽略
+        if (typeof chunk === 'string') {
+          target.push(Buffer.from(chunk, 'utf-8'));
+        } else if (Buffer.isBuffer(chunk)) {
+          target.push(chunk);
+        } else if (chunk instanceof Uint8Array) {
+          target.push(Buffer.from(chunk));
+        } else if (chunk instanceof ArrayBuffer) {
+          target.push(Buffer.from(chunk));
+        } else if (ArrayBuffer.isView(chunk)) {
+          target.push(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+        }
+        // 非二进制/字符串类型，忽略
       }
 
       // 是否应捕获请求/响应体
@@ -215,11 +215,11 @@ function pushChunk(target: Buffer[], chunk: unknown): void {
       } as typeof res.json;
 
       // 拦截 res.write — 累积流式响应块
-      const originalWrite = res.write.bind(res) as typeof res.write;
+      const originalWrite = res.write.bind(res);
       res.write = function (chunk: unknown, ...rest: unknown[]): boolean {
         pushChunk(resChunks, chunk);
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        return originalWrite(chunk as any, ...rest as any);
+        // TypeScript overloads for res.write are complex; safely cast through unknown
+        return (originalWrite as (...args: unknown[]) => boolean)(chunk, ...rest);
       };
 
       // 拦截 res.end — 也捕获可能的尾部 chunk + 写日志

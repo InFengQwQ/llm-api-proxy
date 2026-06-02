@@ -1,21 +1,53 @@
 import type { ProviderConfig } from '../config/index.js';
-import type { ProviderAdapter } from './base.js';
-import { OpenAIAdapter } from './openai.js';
-import { AnthropicAdapter } from './anthropic.js';
-import { OllamaAdapter } from './ollama.js';
-import { GeminiAdapter } from './gemini.js';
+import type { ProviderAdapter, EntryConverter } from './base.js';
+import { OpenAIAdapter, createOpenAIEntryConverter } from './adapters/openai.js';
+import { AnthropicAdapter, createAnthropicEntryConverter } from './adapters/anthropic.js';
+import { OllamaAdapter, createOllamaEntryConverter } from './adapters/ollama.js';
+import { GoogleAdapter, createGoogleEntryConverter } from './adapters/google.js';
+import { OpenAIResponsesAdapter, createResponsesEntryConverter } from './adapters/openai-responses.js';
+import { MultiProtocolAdapter } from './multi.js';
 
-const adapterMap = {
+export type { EntryConverter } from './base.js';
+
+/** protocol key → entry converter 注册表 */
+export const entryConverters: Record<string, EntryConverter> = {
+  openai: createOpenAIEntryConverter(),
+  anthropic: createAnthropicEntryConverter(),
+  google: createGoogleEntryConverter(),
+  ollama: createOllamaEntryConverter(),
+  openai_responses: createResponsesEntryConverter(),
+};
+
+const adapterMap: Record<string, new (config: ProviderConfig) => ProviderAdapter> = {
   openai: OpenAIAdapter,
   anthropic: AnthropicAdapter,
   ollama: OllamaAdapter,
-  gemini: GeminiAdapter,
+  google: GoogleAdapter,
+  openai_responses: OpenAIResponsesAdapter,
 };
 
+/** Return all registered adapter type keys (for 'auto' resolution) */
+export function getAdapterKeys(): string[] {
+  return Object.keys(adapterMap);
+}
+
 export function createAdapter(config: ProviderConfig): ProviderAdapter {
-  const AdapterClass = adapterMap[config.type as keyof typeof adapterMap];
+  const { type } = config;
+
+  // 'auto' → try all registered adapters
+  if (type === 'auto') {
+    return new MultiProtocolAdapter(config, getAdapterKeys());
+  }
+
+  // Array → MultiProtocolAdapter with priority order
+  if (Array.isArray(type)) {
+    return new MultiProtocolAdapter(config, type);
+  }
+
+  // Single string type
+  const AdapterClass = adapterMap[type];
   if (!AdapterClass) {
-    throw new Error(`Unsupported provider type: ${config.type}`);
+    throw new Error(`Unsupported provider type: ${type}`);
   }
   return new AdapterClass(config);
 }
