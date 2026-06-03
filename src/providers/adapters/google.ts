@@ -1,14 +1,13 @@
-import {
-  ChatCompletionRequest,
-  ChatCompletionResponse,
-  StreamChunk,
-  ProviderHealth,
-  ProviderApiError
+import type {
+  UnifiedRequest, UnifiedResponse, UnifiedStreamEvent,
+  UnifiedMessage, UnifiedContentBlock, ProviderHealth,
 } from '../../types/api.js';
+import { ProviderApiError } from '../../types/api.js';
 import type { ProviderConfig } from '../../config/index.js';
 import type { ProviderAdapter, EntryConverter } from '../base.js';
 import { createHealthCheck, fetchModelsGoogleFormat } from '../base.js';
-import type { ChatMessage, GoogleResponse } from '../../types/api.js';
+import { parseUnifiedSSE } from '../unified-utils.js';
+import type { GoogleResponse } from '../../types/api.js';
 
 export class GoogleAdapter implements ProviderAdapter {
   name: string;
@@ -28,172 +27,147 @@ export class GoogleAdapter implements ProviderAdapter {
     return `${this.getBaseUrl()}/v1beta/models/${model}:${endpoint}?${key}`;
   }
 
-  private toGoogleRequest(req: ChatCompletionRequest): Record<string, unknown> {
+  private toGoogleRequest(req: UnifiedRequest): Record<string, unknown> {
     const systemInstructions = req.messages
-      .filter((m) => m.role === 'system')
-      .map((m) => ({ text: m.content ?? '' }));
+      .filter(m => m.role === 'system')
+      .flatMap(m => m.content.filter(b => b.type === 'text'))
+      .map(b => ({ text: (b as { type: 'text'; text: string }).text }));
 
-    const contents = [];
+    const contents: Array<{ role: string; parts: Array<Record<string, unknown>> }> = [];
     let currentRole: string | null = null;
-    let currentParts: Array<{ text?: string }> = [];
+    let currentParts: Array<Record<string, unknown>> = [];
+
+    const flush = () => { if (currentParts.length) { contents.push({ role: currentRole!, parts: currentParts }); } };
 
     for (const msg of req.messages) {
       if (msg.role === 'system') continue;
 
+      if (msg.role === 'tool') {
+        flush();
+        currentRole = 'user'; currentParts = [];
+        const textBlock = msg.content.find(b => b.type === 'text') as { type: 'text'; text: string } | undefined;
+        const content = textBlock?.text ?? '';
+        let response: unknown = content;
+        try { response = JSON.parse(content || '{}'); } catch { /* raw */ }
+        currentParts.push({
+          functionResponse: { name: msg.name ?? '', response: { content: response } },
+        });
+        flush();
+        currentRole = null; currentParts = [];
+        continue;
+      }
+
       const role = msg.role === 'assistant' ? 'model' : 'user';
-      if (role !== currentRole) {
-        if (currentParts.length) {
-          contents.push({ role: currentRole, parts: currentParts });
+      if (role !== currentRole) { flush(); currentRole = role; currentParts = []; }
+
+      for (const b of msg.content) {
+        if (b.type === 'text') {
+          currentParts.push({ text: b.text });
+        } else if (b.type === 'tool_use') {
+          currentParts.push({ functionCall: { name: b.name, args: b.input } });
         }
-        currentRole = role;
-        currentParts = [];
-      }
-
-      if (typeof msg.content === 'string') {
-        currentParts.push({ text: msg.content });
       }
     }
-    if (currentParts.length) {
-      contents.push({ role: currentRole, parts: currentParts });
+    flush();
+
+    const cfg: Record<string, unknown> = {};
+    if (req.temperature !== undefined) cfg.temperature = req.temperature;
+    if (req.top_p !== undefined) cfg.topP = req.top_p;
+    if (req.max_tokens !== undefined) cfg.maxOutputTokens = req.max_tokens;
+
+    const body: Record<string, unknown> = { contents, generationConfig: cfg };
+    if (systemInstructions.length) body.systemInstruction = { parts: systemInstructions };
+
+    if (req.tools?.length) {
+      body.tools = [{ functionDeclarations: req.tools.map(t => ({ name: t.name, description: t.description, parameters: t.parameters })) }];
     }
 
-    const generationConfig: Record<string, unknown> = {};
-    if (req.temperature !== undefined) generationConfig.temperature = req.temperature;
-    if (req.top_p !== undefined) generationConfig.topP = req.top_p;
-    if (req.max_tokens !== undefined) generationConfig.maxOutputTokens = req.max_tokens;
-
-    const body: Record<string, unknown> = {
-      contents,
-      generationConfig,
-    };
-
-    if (systemInstructions.length) {
-      body.systemInstruction = { parts: systemInstructions };
+    if (req.tool_choice !== undefined) {
+      if (req.tool_choice === 'none') body.toolConfig = { functionCallingConfig: { mode: 'NONE' } };
+      else if (req.tool_choice === 'auto') body.toolConfig = { functionCallingConfig: { mode: 'AUTO' } };
+      else if (req.tool_choice === 'any') body.toolConfig = { functionCallingConfig: { mode: 'ANY' } };
+      else if (typeof req.tool_choice === 'object') body.toolConfig = { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: [req.tool_choice.name] } };
     }
 
     return body;
   }
 
-  async send(request: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+  async send(request: UnifiedRequest): Promise<UnifiedResponse> {
     const url = this.buildUrl(request.model, false);
     const body = this.toGoogleRequest(request);
-
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      let payload;
-      try { payload = JSON.parse(errorText); } catch { /* ignore */ }
-      throw new ProviderApiError(`Google API error ${response.status}: ${errorText}`, response.status, payload);
+      const errText = await response.text();
+      let payload; try { payload = JSON.parse(errText); } catch { /* ignore */ }
+      throw new ProviderApiError(`Google API error ${response.status}: ${errText}`, response.status, payload);
     }
 
     const data = await response.json() as {
-      candidates?: Array<{
-        content?: { parts?: Array<{ text?: string }> };
-        finishReason?: string;
-      }>;
-      usageMetadata?: {
-        promptTokenCount?: number;
-        candidatesTokenCount?: number;
-        totalTokenCount?: number;
-      };
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string; functionCall?: { name: string; args: Record<string, unknown> } }> }; finishReason?: string }>;
+      usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number };
     };
 
     const parts = data.candidates?.[0]?.content?.parts ?? [];
-    const texts = parts.map((p) => p.text ?? '').join('');
-    const finishReason = data.candidates?.[0]?.finishReason ?? 'STOP';
+    const content: UnifiedContentBlock[] = [];
+    for (const p of parts) {
+      if (p.text) content.push({ type: 'text', text: p.text });
+      if (p.functionCall) content.push({ type: 'tool_use', id: `call_${Date.now()}`, name: p.functionCall.name, input: p.functionCall.args ?? {} });
+    }
 
     return {
-      id: `google-${Date.now()}`,
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model: request.model,
-      choices: [
-        {
-          index: 0,
-          message: { role: 'assistant', content: texts },
-          finish_reason: finishReason === 'STOP' ? 'stop' : 'length',
-        },
-      ],
-      usage: {
-        prompt_tokens: data.usageMetadata?.promptTokenCount ?? 0,
-        completion_tokens: data.usageMetadata?.candidatesTokenCount ?? 0,
-        total_tokens: data.usageMetadata?.totalTokenCount ?? 0,
-      },
+      id: `google-${Date.now()}`, model: request.model, content,
+      stop_reason: content.some(b => b.type === 'tool_use') ? 'tool_use' : 'stop',
+      usage: { input_tokens: data.usageMetadata?.promptTokenCount ?? 0, output_tokens: data.usageMetadata?.candidatesTokenCount ?? 0 },
     };
   }
 
-  async *sendStreaming(request: ChatCompletionRequest): AsyncGenerator<StreamChunk> {
+  async *sendStreaming(request: UnifiedRequest): AsyncGenerator<UnifiedStreamEvent> {
     const url = this.buildUrl(request.model, true);
     const body = this.toGoogleRequest(request);
-
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      let payload;
-      try { payload = JSON.parse(errorText); } catch { /* ignore */ }
-      throw new ProviderApiError(`Google API error ${response.status}: ${errorText}`, response.status, payload);
+      const errText = await response.text();
+      let payload; try { payload = JSON.parse(errText); } catch { /* ignore */ }
+      throw new ProviderApiError(`Google API error ${response.status}: ${errText}`, response.status, payload);
     }
 
     const reader = response.body?.getReader();
     if (!reader) throw new Error('No response body');
-
     const decoder = new TextDecoder();
-    const chunkId = `google-${Date.now()}`;
-    let accumulatedText = '';
-    let firstChunk = true;
+    const msgId = `google-${Date.now()}`;
+    let started = false;
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-
-      const text = decoder.decode(value, { stream: true });
-      const lines = text.split('\n').filter(Boolean);
-
+      const lines = decoder.decode(value, { stream: true }).split('\n').filter(Boolean);
       for (const line of lines) {
         try {
           const data = JSON.parse(line);
-          const content = data.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (content !== undefined) {
-            accumulatedText += content;
+          const parts: Array<{ text?: string; functionCall?: { name: string; args: Record<string, unknown> } }> = data.candidates?.[0]?.content?.parts ?? [];
 
-            yield {
-              id: chunkId,
-              object: 'chat.completion.chunk',
-              created: Math.floor(Date.now() / 1000),
-              model: request.model,
-              choices: [
-                {
-                  index: 0,
-                  delta: { content },
-                },
-              ],
-            };
-            firstChunk = false;
+          for (const [idx, part] of parts.entries()) {
+            if (part.text !== undefined) {
+              if (!started) { yield { type: 'message_start', id: msgId, model: request.model }; started = true; }
+              yield { type: 'text_delta', text: part.text, index: idx };
+            }
+            if (part.functionCall) {
+              if (!started) { yield { type: 'message_start', id: msgId, model: request.model }; started = true; }
+              yield { type: 'tool_use_start', id: `call_${Date.now()}_${idx}`, name: part.functionCall.name, index: idx };
+              yield { type: 'tool_use_delta', id: `call_${Date.now()}_${idx}`, partial_json: JSON.stringify(part.functionCall.args ?? {}), index: idx };
+            }
+          }
+
+          if (data.candidates?.[0]?.finishReason) {
+            const hasFC = parts.some(p => p.functionCall);
+            yield { type: 'message_stop', stop_reason: hasFC ? 'tool_use' : 'stop' };
           }
         } catch (e) {
           throw new ProviderApiError(`Failed to parse Google SSE line: ${line}`, 500, { error: e });
         }
       }
-    }
-
-    if (firstChunk) {
-      yield {
-        id: chunkId,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: request.model,
-        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-      };
     }
   }
 
@@ -207,85 +181,144 @@ export class GoogleAdapter implements ProviderAdapter {
 }
 
 // ═══════════════════════════════════════════════
-// 入口转换器 — Gemini request → CCR 及反向
+// 入口转换器 — Gemini ↔ Unified
 // ═══════════════════════════════════════════════
-
-const FINISH_MAP: Record<string, 'stop' | 'length'> = { STOP: 'stop', MAX_TOKENS: 'length', SAFETY: 'length', RECITATION: 'length' };
 
 export function createGoogleEntryConverter(): EntryConverter {
   return {
     protocol: 'google',
 
-    toInternal(body: Record<string, unknown>): ChatCompletionRequest {
+    toInternal(body: Record<string, unknown>): UnifiedRequest {
       const systemParts = ((body.systemInstruction as Record<string, unknown>)?.parts as Array<{ text: string }>) ?? [];
-      const generationConfig = (body.generationConfig ?? {}) as Record<string, unknown>;
-      const msgs: ChatMessage[] = [];
+      const genConfig = (body.generationConfig ?? {}) as Record<string, unknown>;
+      const msgs: UnifiedMessage[] = [];
       const sysText = systemParts.map(p => p.text).join('\n');
-      if (sysText) msgs.push({ role: 'system', content: sysText });
+      if (sysText) msgs.push({ role: 'system', content: [{ type: 'text', text: sysText }] });
 
-      const contents = (body.contents ?? []) as Array<{ role: 'user' | 'model'; parts: Array<{ text?: string }> }>;
+      const contents = (body.contents ?? []) as Array<{
+        role: 'user' | 'model';
+        parts: Array<{ text?: string; functionCall?: { name: string; args: Record<string, unknown> }; functionResponse?: { name: string; response: Record<string, unknown> } }>;
+      }>;
+
       for (const c of contents) {
-        const text = c.parts.map(p => p.text ?? '').join('');
-        msgs.push({ role: c.role === 'model' ? 'assistant' : 'user', content: text });
+        for (const part of c.parts) {
+          if (part.functionCall) {
+            msgs.push({ role: 'assistant', content: [{ type: 'tool_use', id: `call_${Date.now()}`, name: part.functionCall.name, input: part.functionCall.args ?? {} }] });
+          } else if (part.functionResponse) {
+            const resultStr = typeof part.functionResponse.response === 'string'
+              ? part.functionResponse.response
+              : JSON.stringify(part.functionResponse.response?.content ?? part.functionResponse.response ?? '');
+            msgs.push({ role: 'tool', content: [{ type: 'text', text: resultStr }], name: part.functionResponse.name });
+          } else if (part.text !== undefined) {
+            msgs.push({ role: c.role === 'model' ? 'assistant' : 'user', content: [{ type: 'text', text: part.text }] });
+          }
+        }
+      }
+
+      const googleTools = (body.tools ?? []) as Array<{ functionDeclarations?: Array<{ name: string; description?: string; parameters?: Record<string, unknown> }> }>;
+      let tools: UnifiedRequest['tools'];
+      if (googleTools.length > 0 && googleTools[0].functionDeclarations) {
+        tools = googleTools[0].functionDeclarations.map(fd => ({ name: fd.name, description: fd.description, parameters: fd.parameters }));
+      }
+
+      const callingCfg = ((body.toolConfig as Record<string, unknown>)?.functionCallingConfig) as Record<string, unknown> | undefined;
+      let toolChoice: UnifiedRequest['tool_choice'];
+      if (callingCfg) {
+        if (callingCfg.mode === 'NONE') toolChoice = 'none';
+        else if (callingCfg.mode === 'AUTO') toolChoice = 'auto';
+        else if (callingCfg.mode === 'ANY') {
+          const allowed = callingCfg.allowedFunctionNames as string[] | undefined;
+          toolChoice = allowed?.length === 1 ? { type: 'tool', name: allowed[0] } : 'auto';
+        }
       }
 
       return {
         model: (body.model as string) ?? '', messages: msgs,
-        temperature: generationConfig.temperature as number | undefined,
-        top_p: generationConfig.topP as number | undefined,
-        max_tokens: generationConfig.maxOutputTokens as number | undefined,
+        temperature: genConfig.temperature as number | undefined,
+        top_p: genConfig.topP as number | undefined,
+        max_tokens: genConfig.maxOutputTokens as number | undefined,
         stream: body.stream as boolean | undefined,
-        stop: generationConfig.stopSequences as string[] | undefined,
+        stop_sequences: genConfig.stopSequences as string[] | undefined,
+        tools, tool_choice: toolChoice,
       };
     },
 
-    fromInternal(ccResp: ChatCompletionResponse): GoogleResponse {
-      const text = ccResp.choices[0]?.message?.content ?? '';
-      const rawFinish = ccResp.choices[0]?.finish_reason ?? 'stop';
+    fromInternal(resp: UnifiedResponse): GoogleResponse {
+      const parts: Array<{ text?: string; functionCall?: { name: string; args: Record<string, unknown> } }> = [];
+      for (const b of resp.content) {
+        if (b.type === 'text') parts.push({ text: b.text });
+        else if (b.type === 'tool_use') parts.push({ functionCall: { name: b.name, args: b.input } });
+      }
+      const googleFinish = resp.stop_reason === 'tool_use' ? 'STOP' : 'STOP';
       return {
-        candidates: [{ content: { parts: [{ text }], role: 'model' }, finishReason: rawFinish === 'stop' ? 'STOP' : 'MAX_TOKENS' }],
-        usageMetadata: { promptTokenCount: ccResp.usage?.prompt_tokens ?? 0, candidatesTokenCount: ccResp.usage?.completion_tokens ?? 0, totalTokenCount: ccResp.usage?.total_tokens ?? 0 },
+        candidates: [{ content: { parts, role: 'model' }, finishReason: googleFinish }],
+        usageMetadata: { promptTokenCount: resp.usage.input_tokens, candidatesTokenCount: resp.usage.output_tokens, totalTokenCount: resp.usage.input_tokens + resp.usage.output_tokens },
       };
     },
 
     transformStream(source: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
       const encoder = new TextEncoder();
-      const decoder = new TextDecoder();
       return new ReadableStream<Uint8Array>({
         async start(controller) {
-          const reader = source.getReader();
-          let buffer = ''; let finished = false;
+          const toolAccum = new Map<number, { name: string; args: string }>();
+          let finished = false;
           try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              buffer += decoder.decode(value, { stream: true });
-              const lines = buffer.split('\n'); buffer = lines.pop() ?? '';
-              for (const line of lines) {
-                if (!line.startsWith('data: ')) continue;
-                const data = line.slice(6).trim();
-                if (data === '[DONE]') { finished = true; continue; }
-                try {
-                  const chunk = JSON.parse(data);
-                  const content = chunk.choices?.[0]?.delta?.content;
-                  const reasoning = chunk.choices?.[0]?.delta?.reasoning_content;
-                  const finishReason = chunk.choices?.[0]?.finish_reason;
-                  if (reasoning !== undefined && reasoning !== null)
-                    controller.enqueue(encoder.encode(JSON.stringify({ candidates: [{ content: { parts: [{ text: reasoning, thought: true }] } }] }) + '\n'));
-                  if (content !== undefined && content !== null)
-                    controller.enqueue(encoder.encode(JSON.stringify({ candidates: [{ content: { parts: [{ text: content }] } }] }) + '\n'));
-                  if (finishReason) {
-                    finished = true;
-                    controller.enqueue(encoder.encode(JSON.stringify({
-                      candidates: [{ content: { parts: [{ text: '' }] }, finishReason: FINISH_MAP[finishReason.toUpperCase()] === 'stop' ? 'STOP' : 'MAX_TOKENS' }],
-                      usageMetadata: chunk.usage ? { promptTokenCount: chunk.usage.prompt_tokens, candidatesTokenCount: chunk.usage.completion_tokens, totalTokenCount: chunk.usage.total_tokens } : undefined,
-                    }) + '\n'));
+            for await (const event of parseUnifiedSSE(source)) {
+              switch (event.type) {
+                case 'text_delta':
+                  controller.enqueue(encoder.encode(
+                    `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: event.text }], role: 'model' } }] })}\n\n`
+                  ));
+                  break;
+
+                case 'tool_use_start':
+                  toolAccum.set(event.index, { name: event.name, args: '' });
+                  break;
+
+                case 'tool_use_delta': {
+                  const acc = toolAccum.get(event.index);
+                  if (acc) acc.args += event.partial_json;
+                  break;
+                }
+
+                case 'content_block_stop': {
+                  const acc = toolAccum.get(event.index);
+                  if (acc) {
+                    let parsedArgs: Record<string, unknown> = {};
+                    try { parsedArgs = JSON.parse(acc.args); } catch { /* emit empty */ }
+                    controller.enqueue(encoder.encode(
+                      `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ functionCall: { name: acc.name, args: parsedArgs } }], role: 'model' } }] })}\n\n`
+                    ));
+                    toolAccum.delete(event.index);
                   }
-                } catch { /* skip */ }
+                  break;
+                }
+
+                case 'message_stop': {
+                  finished = true;
+                  const resp: Record<string, unknown> = {
+                    candidates: [{ content: { parts: [], role: 'model' }, finishReason: 'STOP' }],
+                  };
+                  if (event.usage) {
+                    resp.usageMetadata = {
+                      promptTokenCount: event.usage.input_tokens,
+                      candidatesTokenCount: event.usage.output_tokens,
+                      totalTokenCount: event.usage.input_tokens + event.usage.output_tokens,
+                    };
+                  }
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(resp)}\n\n`));
+                  break;
+                }
               }
             }
-            if (!finished) controller.enqueue(encoder.encode(JSON.stringify({ candidates: [{ content: { parts: [{ text: '' }] }, finishReason: 'STOP' }] }) + '\n'));
-          } finally { controller.close(); reader.releaseLock(); }
+          } finally {
+            if (!finished) {
+              controller.enqueue(encoder.encode(
+                `data: ${JSON.stringify({ candidates: [{ content: { parts: [], role: 'model' }, finishReason: 'STOP' }] })}\n\n`
+              ));
+            }
+            controller.close();
+          }
         },
       });
     },

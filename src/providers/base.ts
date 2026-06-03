@@ -1,7 +1,7 @@
 import type {
-  ChatCompletionRequest,
-  ChatCompletionResponse,
-  StreamChunk,
+  UnifiedRequest,
+  UnifiedResponse,
+  UnifiedStreamEvent,
   ProviderHealth,
 } from '../types/api.js';
 
@@ -9,23 +9,27 @@ import type {
 // 接口定义
 // ═══════════════════════════════════════════════
 
+/** 上游 Provider 适配器：UnifiedRequest → 上游协议 */
 export interface ProviderAdapter {
   name: string;
   type: string;
 
-  send(request: ChatCompletionRequest): Promise<ChatCompletionResponse>;
-  sendStreaming(request: ChatCompletionRequest): AsyncGenerator<StreamChunk>;
+  send(request: UnifiedRequest): Promise<UnifiedResponse>;
+  sendStreaming(request: UnifiedRequest): AsyncGenerator<UnifiedStreamEvent>;
   health(): Promise<ProviderHealth>;
   /** 从 Provider 的 /models（或等价）端点拉取模型 ID 列表 */
   fetchModels(): Promise<string[]>;
 }
 
-/** 入口协议双向转换器 — 和 ProviderAdapter 同文件，共享字段映射逻辑 */
+/** 入口协议双向转换器：原生协议 ↔ Unified 格式 */
 export interface EntryConverter {
   readonly protocol: string;
-  toInternal(body: Record<string, unknown>): ChatCompletionRequest;
-  fromInternal(ccResp: ChatCompletionResponse, model: string): unknown;
-  transformStream(source: ReadableStream<Uint8Array>, model: string): ReadableStream<Uint8Array>;
+  /** 原生 JSON body → UnifiedRequest */
+  toInternal(body: Record<string, unknown>): UnifiedRequest;
+  /** UnifiedResponse → 原生 JSON（非流式） */
+  fromInternal(resp: UnifiedResponse): unknown;
+  /** UnifiedStreamEvent 流 → 原生 SSE ReadableStream */
+  transformStream(source: ReadableStream<Uint8Array>): ReadableStream<Uint8Array>;
 }
 
 // ═══════════════════════════════════════════════

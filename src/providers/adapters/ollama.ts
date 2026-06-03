@@ -1,14 +1,12 @@
-import {
-  ChatCompletionRequest,
-  ChatCompletionResponse,
-  StreamChunk,
-  ProviderHealth,
-  ProviderApiError
+import type {
+  UnifiedRequest, UnifiedResponse, UnifiedStreamEvent,
+  UnifiedMessage, UnifiedContentBlock, ProviderHealth,
 } from '../../types/api.js';
+import { ProviderApiError } from '../../types/api.js';
 import type { ProviderConfig } from '../../config/index.js';
 import type { ProviderAdapter, EntryConverter } from '../base.js';
 import { createHealthCheck, fetchModelsGoogleFormat } from '../base.js';
-import type { OllamaResponse } from '../../types/api.js';
+import { parseUnifiedSSE } from '../unified-utils.js';
 
 export class OllamaAdapter implements ProviderAdapter {
   name: string;
@@ -22,182 +20,151 @@ export class OllamaAdapter implements ProviderAdapter {
     return this.config.base_url ?? 'http://localhost:11434';
   }
 
-  /**
-   * Fetch with retry on 503 — Ollama returns 503 when a model is still
-   * loading into memory. Retry with exponential backoff (2s, 4s, 8s, 16s).
-   */
   private async fetchWithRetry(body: Record<string, unknown>, maxRetries = 4): Promise<Response> {
     const url = `${this.getBaseUrl()}/api/chat`;
-
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       const controller = new AbortController();
-      const timeoutMs = 120_000; // 2 min total — generous for model loading
-      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
+      const timeoutId = setTimeout(() => controller.abort(), 120_000);
       try {
         const response = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-          signal: controller.signal,
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body), signal: controller.signal,
         });
-
-        // 503 "model loading" is transient — retry after backoff
         if (response.status === 503 && attempt < maxRetries) {
           const delay = Math.min(2000 * Math.pow(2, attempt), 16000);
-          console.warn(
-            `[Ollama] 503 (model loading), retrying in ${delay / 1000}s ` +
-            `(attempt ${attempt + 1}/${maxRetries})`
-          );
-          // Drain the response body to avoid memory leaks
+          console.warn(`[Ollama] 503 (model loading), retrying in ${delay / 1000}s (attempt ${attempt + 1}/${maxRetries})`);
           await response.text().catch(() => {});
           await new Promise(resolve => setTimeout(resolve, delay));
           continue;
         }
-
         return response;
       } catch (err) {
-        // On network error / abort, retry if we have attempts left
         if (attempt < maxRetries) {
           const delay = Math.min(2000 * Math.pow(2, attempt), 16000);
-          console.warn(
-            `[Ollama] fetch error, retrying in ${delay / 1000}s ` +
-            `(attempt ${attempt + 1}/${maxRetries}): ${err instanceof Error ? err.message : String(err)}`
-          );
+          console.warn(`[Ollama] fetch error, retrying in ${delay / 1000}s`);
           await new Promise(resolve => setTimeout(resolve, delay));
           continue;
         }
         throw err;
-      } finally {
-        clearTimeout(timeoutId);
-      }
+      } finally { clearTimeout(timeoutId); }
     }
-
-    // Unreachable — loop always returns or throws
     throw new Error('Ollama fetchWithRetry: max retries exceeded');
   }
 
-  async send(request: ChatCompletionRequest): Promise<ChatCompletionResponse> {
-    const body = {
-      model: request.model,
-      messages: request.messages,
-      stream: false,
-      options: {
-        temperature: request.temperature,
-        top_p: request.top_p,
-        num_predict: request.max_tokens,
-      },
+  async send(request: UnifiedRequest): Promise<UnifiedResponse> {
+    const body: Record<string, unknown> = {
+      model: request.model, stream: false,
+      messages: request.messages.map(m => ({
+        role: m.role,
+        content: m.content.filter(b => b.type === 'text').map(b => (b as { type: 'text'; text: string }).text).join('') || '',
+        ...(m.content.some(b => b.type === 'tool_use') ? {
+          tool_calls: m.content.filter(b => b.type === 'tool_use').map(b => ({
+            id: (b as { type: 'tool_use'; id: string }).id,
+            type: 'function',
+            function: { name: (b as { type: 'tool_use'; name: string }).name, arguments: JSON.stringify((b as { type: 'tool_use'; input: Record<string, unknown> }).input) },
+          })),
+        } : {}),
+      })),
+      options: { temperature: request.temperature, top_p: request.top_p, num_predict: request.max_tokens },
     };
 
-    const response = await this.fetchWithRetry(body);
+    if (request.tools?.length) body.tools = request.tools;
+    if (request.tool_choice !== undefined) body.tool_choice = request.tool_choice;
 
+    const response = await this.fetchWithRetry(body);
     if (!response.ok) {
-      const errorText = await response.text();
-      let payload;
-      try { payload = JSON.parse(errorText); } catch { /* ignore */ }
-      throw new ProviderApiError(`Ollama API error ${response.status}: ${errorText}`, response.status, payload);
+      const errText = await response.text();
+      let payload; try { payload = JSON.parse(errText); } catch { /* ignore */ }
+      throw new ProviderApiError(`Ollama API error ${response.status}: ${errText}`, response.status, payload);
     }
 
     const data = await response.json() as {
-      model: string;
-      message: { role: string; content: string };
-      total_duration: number;
+      message?: { role?: string; content?: string; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> };
     };
 
+    const content: UnifiedContentBlock[] = [];
+    if (data.message?.content) content.push({ type: 'text', text: data.message.content });
+    if (data.message?.tool_calls) {
+      for (const tc of data.message.tool_calls) {
+        let input: Record<string, unknown> = {};
+        try { input = JSON.parse(tc.function.arguments || '{}'); } catch { /* ignore */ }
+        content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
+      }
+    }
+
     return {
-      id: `ollama-${Date.now()}`,
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model: request.model,
-      choices: [{
-        index: 0,
-        message: { role: 'assistant', content: data.message.content },
-        finish_reason: 'stop',
-      }],
-      usage: {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-      },
+      id: `ollama-${Date.now()}`, model: request.model, content,
+      stop_reason: content.some(b => b.type === 'tool_use') ? 'tool_use' : 'stop',
+      usage: { input_tokens: 0, output_tokens: 0 },
     };
   }
 
-  async *sendStreaming(request: ChatCompletionRequest): AsyncGenerator<StreamChunk> {
-    const body = {
-      model: request.model,
-      messages: request.messages,
-      stream: true,
-      options: {
-        temperature: request.temperature,
-        top_p: request.top_p,
-        num_predict: request.max_tokens,
-      },
+  async *sendStreaming(request: UnifiedRequest): AsyncGenerator<UnifiedStreamEvent> {
+    const body: Record<string, unknown> = {
+      model: request.model, stream: true,
+      messages: request.messages.map(m => ({
+        role: m.role,
+        content: m.content.filter(b => b.type === 'text').map(b => (b as { type: 'text'; text: string }).text).join('') || '',
+        ...(m.content.some(b => b.type === 'tool_use') ? {
+          tool_calls: m.content.filter(b => b.type === 'tool_use').map(b => ({
+            id: (b as { type: 'tool_use'; id: string }).id,
+            type: 'function',
+            function: { name: (b as { type: 'tool_use'; name: string }).name, arguments: JSON.stringify((b as { type: 'tool_use'; input: Record<string, unknown> }).input) },
+          })),
+        } : {}),
+      })),
+      options: { temperature: request.temperature, top_p: request.top_p, num_predict: request.max_tokens },
     };
+    if (request.tools?.length) body.tools = request.tools;
+    if (request.tool_choice !== undefined) body.tool_choice = request.tool_choice;
 
     const response = await this.fetchWithRetry(body);
-
     if (!response.ok) {
-      const errorText = await response.text();
-      let payload;
-      try { payload = JSON.parse(errorText); } catch { /* ignore */ }
-      throw new ProviderApiError(`Ollama API error ${response.status}: ${errorText}`, response.status, payload);
+      const errText = await response.text();
+      let payload; try { payload = JSON.parse(errText); } catch { /* ignore */ }
+      throw new ProviderApiError(`Ollama API error ${response.status}: ${errText}`, response.status, payload);
     }
 
     const reader = response.body?.getReader();
     if (!reader) throw new Error('No response body');
-
     const decoder = new TextDecoder();
-    const chunkId = `ollama-${Date.now()}`;
+    const msgId = `ollama-${Date.now()}`;
+    let started = false;
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-
-      const text = decoder.decode(value, { stream: true });
-      try {
-        const lines = text.split('\n').filter(Boolean);
-        for (const line of lines) {
+      const lines = decoder.decode(value, { stream: true }).split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
           const event = JSON.parse(line);
+          const msg = event.message as Record<string, unknown> | undefined;
 
-          // Ollama thinking/reasoning content (exposed as "thinking" field in chat API)
-          const thinkingContent = (event.message as Record<string, unknown> | undefined)?.thinking as string | undefined;
-          if (thinkingContent !== undefined && thinkingContent !== '') {
-            yield {
-              id: chunkId,
-              object: 'chat.completion.chunk',
-              created: Math.floor(Date.now() / 1000),
-              model: request.model,
-              choices: [{
-                index: 0,
-                delta: { reasoning_content: thinkingContent },
-              }],
-            };
+          if (msg?.thinking) {
+            if (!started) { yield { type: 'message_start', id: msgId, model: request.model }; started = true; }
+            yield { type: 'thinking_delta', thinking: msg.thinking as string, index: 0 };
           }
 
-          if (event.message?.content) {
-            yield {
-              id: chunkId,
-              object: 'chat.completion.chunk',
-              created: Math.floor(Date.now() / 1000),
-              model: request.model,
-              choices: [{
-                index: 0,
-                delta: { content: event.message.content },
-              }],
-            };
+          const toolCalls = msg?.tool_calls as Array<{ id: string; function: { name: string; arguments: string } }> | undefined;
+          if (toolCalls?.length) {
+            if (!started) { yield { type: 'message_start', id: msgId, model: request.model }; started = true; }
+            for (const tc of toolCalls) {
+              yield { type: 'tool_use_start', id: tc.id, name: tc.function.name, index: 0 };
+              yield { type: 'tool_use_delta', id: tc.id, partial_json: tc.function.arguments, index: 0 };
+            }
           }
+
+          if (msg?.content) {
+            if (!started) { yield { type: 'message_start', id: msgId, model: request.model }; started = true; }
+            yield { type: 'text_delta', text: msg.content as string, index: 0 };
+          }
+
           if (event.done) {
-            yield {
-              id: chunkId,
-              object: 'chat.completion.chunk',
-              created: Math.floor(Date.now() / 1000),
-              model: request.model,
-              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-            };
+            yield { type: 'message_stop', stop_reason: toolCalls?.length ? 'tool_use' : 'stop' };
           }
+        } catch (e) {
+          throw new ProviderApiError('Failed to parse Ollama stream line', 500, { error: e });
         }
-      } catch (e) {
-        throw new ProviderApiError(`Failed to parse Ollama stream line`, 500, { error: e });
       }
     }
   }
@@ -207,65 +174,119 @@ export class OllamaAdapter implements ProviderAdapter {
   }
 
   async fetchModels(): Promise<string[]> {
-    // Ollama uses /api/tags with { models: [{ name }] } — same shape as Google
     return fetchModelsGoogleFormat(`${this.getBaseUrl()}/api/tags`);
   }
 }
 
 // ═══════════════════════════════════════════════
-// 入口转换器 — Ollama request → CCR 及反向
+// 入口转换器 — Ollama ↔ Unified
 // ═══════════════════════════════════════════════
 
 export function createOllamaEntryConverter(): EntryConverter {
   return {
     protocol: 'ollama',
 
-    toInternal(body: Record<string, unknown>): ChatCompletionRequest {
+    toInternal(body: Record<string, unknown>): UnifiedRequest {
       const options = (body.options ?? {}) as Record<string, unknown>;
+      const msgs = ((body.messages ?? []) as Array<{ role: string; content: string; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> }>).map(m => {
+        const blocks: UnifiedContentBlock[] = [];
+        if (m.content) blocks.push({ type: 'text', text: m.content });
+        if (m.tool_calls) {
+          for (const tc of m.tool_calls) {
+            let input: Record<string, unknown> = {};
+            try { input = JSON.parse(tc.function.arguments || '{}'); } catch { /* ignore */ }
+            blocks.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
+          }
+        }
+        return { role: m.role as UnifiedMessage['role'], content: blocks };
+      });
+
       return {
-        model: (body.model as string) ?? '',
-        messages: (body.messages ?? []) as ChatCompletionRequest['messages'],
+        model: (body.model as string) ?? '', messages: msgs,
         temperature: options.temperature as number | undefined,
         top_p: options.top_p as number | undefined,
         max_tokens: options.num_predict as number | undefined,
         stream: body.stream as boolean | undefined,
-        stop: options.stop as string[] | undefined,
+        stop_sequences: options.stop as string[] | undefined,
+        tools: body.tools as UnifiedRequest['tools'],
+        tool_choice: body.tool_choice as UnifiedRequest['tool_choice'],
       };
     },
 
-    fromInternal(ccResp: ChatCompletionResponse): OllamaResponse {
-      return { model: ccResp.model, message: { role: 'assistant', content: ccResp.choices[0]?.message?.content ?? '' }, done: true };
+    fromInternal(resp: UnifiedResponse): unknown {
+      const texts = resp.content.filter(b => b.type === 'text').map(b => (b as { type: 'text'; text: string }).text).join('');
+      const toolCalls = resp.content.filter(b => b.type === 'tool_use').map(b => ({
+        id: (b as { type: 'tool_use'; id: string }).id,
+        type: 'function',
+        function: { name: (b as { type: 'tool_use'; name: string }).name, arguments: JSON.stringify((b as { type: 'tool_use'; input: Record<string, unknown> }).input) },
+      }));
+      return {
+        model: resp.model,
+        message: { role: 'assistant', content: texts, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) },
+        done: true,
+      };
     },
 
-    transformStream(source: ReadableStream<Uint8Array>, model: string): ReadableStream<Uint8Array> {
-      const encoder = new TextEncoder(); const decoder = new TextDecoder();
+    transformStream(source: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+      const encoder = new TextEncoder();
       return new ReadableStream<Uint8Array>({
         async start(controller) {
-          const reader = source.getReader(); let buffer = '';
+          const toolAccum = new Map<number, { id: string; name: string; args: string }>();
+          let model = '';
+          const createdAt = new Date().toISOString();
           try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              buffer += decoder.decode(value, { stream: true });
-              const lines = buffer.split('\n'); buffer = lines.pop() ?? '';
-              for (const line of lines) {
-                if (!line.startsWith('data: ')) continue;
-                const data = line.slice(6).trim();
-                if (data === '[DONE]') { controller.enqueue(encoder.encode(JSON.stringify({ model, message: { role: 'assistant', content: '' }, done: true }) + '\n')); continue; }
-                try {
-                  const chunk = JSON.parse(data);
-                  const reasoning = chunk.choices?.[0]?.delta?.reasoning_content;
-                  const content = chunk.choices?.[0]?.delta?.content;
-                  if (reasoning !== undefined && reasoning !== null)
-                    controller.enqueue(encoder.encode(JSON.stringify({ model, message: { role: 'assistant', content: '', thinking: reasoning }, done: false }) + '\n'));
-                  if (content !== undefined && content !== null)
-                    controller.enqueue(encoder.encode(JSON.stringify({ model, message: { role: 'assistant', content }, done: false }) + '\n'));
-                  if (chunk.choices?.[0]?.finish_reason)
-                    controller.enqueue(encoder.encode(JSON.stringify({ model, message: { role: 'assistant', content: '' }, done: true }) + '\n'));
-                } catch { /* skip */ }
+            for await (const event of parseUnifiedSSE(source)) {
+              switch (event.type) {
+                case 'message_start':
+                  model = event.model;
+                  break;
+
+                case 'text_delta':
+                  controller.enqueue(encoder.encode(
+                    JSON.stringify({ model, created_at: createdAt, message: { role: 'assistant', content: event.text, images: null }, done: false }) + '\n'
+                  ));
+                  break;
+
+                case 'tool_use_start':
+                  toolAccum.set(event.index, { id: event.id, name: event.name, args: '' });
+                  break;
+
+                case 'tool_use_delta': {
+                  const acc = toolAccum.get(event.index);
+                  if (acc) acc.args += event.partial_json;
+                  break;
+                }
+
+                case 'content_block_stop': {
+                  const acc = toolAccum.get(event.index);
+                  if (acc) {
+                    let parsedArgs: Record<string, unknown> = {};
+                    try { parsedArgs = JSON.parse(acc.args); } catch { /* use empty */ }
+                    controller.enqueue(encoder.encode(
+                      JSON.stringify({
+                        model, created_at: createdAt,
+                        message: {
+                          role: 'assistant', content: '', images: null,
+                          tool_calls: [{ function: { name: acc.name, arguments: parsedArgs } }],
+                        },
+                        done: false,
+                      }) + '\n'
+                    ));
+                    toolAccum.delete(event.index);
+                  }
+                  break;
+                }
+
+                case 'message_stop':
+                  controller.enqueue(encoder.encode(
+                    JSON.stringify({ model, created_at: createdAt, message: { role: 'assistant', content: '', images: null }, done: true }) + '\n'
+                  ));
+                  break;
               }
             }
-          } finally { reader.releaseLock(); controller.close(); }
+          } finally {
+            controller.close();
+          }
         },
       });
     },

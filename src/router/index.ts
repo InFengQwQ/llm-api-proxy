@@ -1,4 +1,4 @@
-import type { ChatCompletionRequest, StreamChunk } from '../types/api.js';
+import type { UnifiedRequest, UnifiedStreamEvent } from '../types/api.js';
 import { ProviderApiError } from '../types/api.js';
 import type { ProviderConfig, AutoRoutingConfig, AutoRoutingGroup } from '../config/index.js';
 import type { ProviderAdapter } from '../providers/base.js';
@@ -165,7 +165,7 @@ export class Router {
    */
   private async executeNonStreaming(
     entry: ProviderEntry,
-    request: ChatCompletionRequest,
+    request: UnifiedRequest,
     modelId: string,
     providerName: string,
     requestId: string,
@@ -281,7 +281,7 @@ export class Router {
 
   async route(
     fullModelId: string,
-    request: ChatCompletionRequest,
+    request: UnifiedRequest,
     requestId: string,
     sessionId?: string
   ): Promise<Response> {
@@ -315,7 +315,7 @@ export class Router {
 
   private async routeAuto(
     group: string,
-    request: ChatCompletionRequest,
+    request: UnifiedRequest,
     requestId: string,
     sessionId?: string
   ): Promise<Response> {
@@ -366,7 +366,7 @@ export class Router {
 
   private async executeTarget(
     target: string,
-    request: ChatCompletionRequest,
+    request: UnifiedRequest,
     requestId: string
   ): Promise<Response> {
     const resolved = this.resolveProvider(target);
@@ -389,7 +389,7 @@ export class Router {
    */
   private async executeStreamingTarget(
     entry: ProviderEntry,
-    request: ChatCompletionRequest,
+    request: UnifiedRequest,
     target: string,
     providerName: string,
     requestId: string,
@@ -436,12 +436,12 @@ export class Router {
 
   private streamToReadableStream(
     entry: ProviderEntry,
-    request: ChatCompletionRequest,
+    request: UnifiedRequest,
     modelId: string,
     providerName: string,
     requestId: string,
-    iterator?: AsyncGenerator<StreamChunk>,
-    headChunk?: StreamChunk
+    iterator?: AsyncGenerator<UnifiedStreamEvent>,
+    headChunk?: UnifiedStreamEvent
   ): ReadableStream<Uint8Array> {
     const encoder = new TextEncoder();
     const iter = iterator ?? entry.adapter.sendStreaming(request);

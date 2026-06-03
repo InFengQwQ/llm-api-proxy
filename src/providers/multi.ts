@@ -1,10 +1,10 @@
 import {
-  ChatCompletionRequest,
-  ChatCompletionResponse,
-  StreamChunk,
+  UnifiedRequest,
+  UnifiedResponse,
+  UnifiedStreamEvent,
   ProviderHealth,
-  ProviderApiError
 } from '../types/api.js';
+import { ProviderApiError } from '../types/api.js';
 import type { ProviderConfig } from '../config/index.js';
 import type { ProviderAdapter } from './base.js';
 import { createAdapter, getAdapterKeys } from './index.js';
@@ -134,11 +134,11 @@ export class MultiProtocolAdapter implements ProviderAdapter {
     throw lastError ?? new Error(`[multi] No adapter succeeded for model "${model}"`);
   }
 
-  async send(request: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+  async send(request: UnifiedRequest): Promise<UnifiedResponse> {
     return this.executeWithFallback(request.model, (adapter) => adapter.send(request));
   }
 
-  async *sendStreaming(request: ChatCompletionRequest): AsyncGenerator<StreamChunk> {
+  async *sendStreaming(request: UnifiedRequest): AsyncGenerator<UnifiedStreamEvent> {
     const model = request.model;
 
     // 1. Check cache

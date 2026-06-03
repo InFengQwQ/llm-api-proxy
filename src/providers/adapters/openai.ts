@@ -1,16 +1,23 @@
-import {
-  ChatCompletionRequest,
-  ChatCompletionResponse,
-  StreamChunk,
+import type {
+  UnifiedRequest,
+  UnifiedResponse,
+  UnifiedStreamEvent,
   ProviderHealth,
-  ProviderApiError
 } from '../../types/api.js';
+import { ProviderApiError as ProviderApiErrorClass } from '../../types/api.js';
 import type { ProviderConfig } from '../../config/index.js';
 import type { ProviderAdapter, EntryConverter } from '../base.js';
 import {
   createHealthCheck,
   fetchModelsOpenAIFormat,
 } from '../base.js';
+import {
+  chatMessagesToUnified,
+  unifiedToChatMessages,
+  blocksToText,
+  blocksToToolCalls,
+  parseUnifiedSSE,
+} from '../unified-utils.js';
 
 export class OpenAIAdapter implements ProviderAdapter {
   name: string;
@@ -25,21 +32,18 @@ export class OpenAIAdapter implements ProviderAdapter {
   }
 
   private getHeaders(): Record<string, string> {
-    const headers: Record<string, string> = {
+    return {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${this.config.api_key ?? ''}`,
     };
-    return headers;
   }
 
-  private buildRequestBody(request: ChatCompletionRequest, stream: boolean): Record<string, unknown> {
-    // Strip null/undefined content, name, and tool_call_id from messages
-    // to prevent upstream deserialization failures (e.g., 'null' not matching
-    // ChatCompletionRequestUserMessageContent enum variants).
-    const cleanMessages = request.messages.map(m => {
+  private buildRequestBody(request: UnifiedRequest, stream: boolean): Record<string, unknown> {
+    const chatMsgs = unifiedToChatMessages(request.messages);
+    const cleanMessages = chatMsgs.map(m => {
       const cleaned: Record<string, unknown> = {
         role: m.role,
-        content: m.content ?? '', // null content → empty string for user/assistant
+        content: m.content ?? '',
       };
       if (m.name) cleaned.name = m.name;
       if (m.tool_call_id) cleaned.tool_call_id = m.tool_call_id;
@@ -55,18 +59,56 @@ export class OpenAIAdapter implements ProviderAdapter {
     if (request.temperature !== undefined) body.temperature = request.temperature;
     if (request.top_p !== undefined) body.top_p = request.top_p;
     if (request.max_tokens !== undefined) body.max_tokens = request.max_tokens;
-    if (request.stop !== undefined) body.stop = request.stop;
-    if (request.tools !== undefined) body.tools = request.tools;
-    if (request.tool_choice !== undefined) body.tool_choice = request.tool_choice;
-    if (request.response_format !== undefined) body.response_format = request.response_format;
-    if (request.seed !== undefined) body.seed = request.seed;
-    if (request.presence_penalty !== undefined) body.presence_penalty = request.presence_penalty;
-    if (request.frequency_penalty !== undefined) body.frequency_penalty = request.frequency_penalty;
-    if (request.user !== undefined) body.user = request.user;
+    if (request.stop_sequences !== undefined) body.stop = request.stop_sequences;
+    if (request.tools?.length) {
+      body.tools = request.tools.map(t => ({
+        type: 'function',
+        function: { name: t.name, description: t.description, parameters: t.parameters },
+      }));
+    }
+    if (request.tool_choice !== undefined) {
+      if (typeof request.tool_choice === 'object') {
+        body.tool_choice = { type: 'function', function: { name: request.tool_choice.name } };
+      } else {
+        body.tool_choice = request.tool_choice;
+      }
+    }
     return body;
   }
 
-  async send(request: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+  private toUnifiedResponse(data: Record<string, unknown>, requestModel: string): UnifiedResponse {
+    const choices = (data.choices ?? []) as Array<{
+      message?: { role?: string; content?: string | null; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> };
+      finish_reason?: string;
+    }>;
+    const choice = choices[0];
+    const content: UnifiedResponse['content'] = [];
+
+    if (choice?.message?.content) {
+      content.push({ type: 'text', text: choice.message.content });
+    }
+    if (choice?.message?.tool_calls) {
+      for (const tc of choice.message.tool_calls) {
+        let input: Record<string, unknown> = {};
+        try { input = JSON.parse(tc.function.arguments || '{}'); } catch { /* ignore */ }
+        content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
+      }
+    }
+
+    const usage = (data.usage ?? {}) as { prompt_tokens?: number; completion_tokens?: number };
+    return {
+      id: (data.id as string) ?? `openai-${Date.now()}`,
+      model: requestModel,
+      content,
+      stop_reason: choice?.finish_reason === 'tool_calls' ? 'tool_use' : 'stop',
+      usage: {
+        input_tokens: usage.prompt_tokens ?? 0,
+        output_tokens: usage.completion_tokens ?? 0,
+      },
+    };
+  }
+
+  async send(request: UnifiedRequest): Promise<UnifiedResponse> {
     const body = this.buildRequestBody(request, false);
 
     const response = await fetch(`${this.getBaseUrl()}/v1/chat/completions`, {
@@ -79,13 +121,13 @@ export class OpenAIAdapter implements ProviderAdapter {
       const errorText = await response.text();
       let payload;
       try { payload = JSON.parse(errorText); } catch { /* ignore */ }
-      throw new ProviderApiError(`OpenAI API error ${response.status}: ${errorText}`, response.status, payload);
+      throw new ProviderApiErrorClass(`OpenAI API error ${response.status}: ${errorText}`, response.status, payload);
     }
 
-    return response.json() as Promise<ChatCompletionResponse>;
+    return this.toUnifiedResponse(await response.json() as Record<string, unknown>, request.model);
   }
 
-  async *sendStreaming(request: ChatCompletionRequest): AsyncGenerator<StreamChunk> {
+  async *sendStreaming(request: UnifiedRequest): AsyncGenerator<UnifiedStreamEvent> {
     const body = this.buildRequestBody(request, true);
 
     const response = await fetch(`${this.getBaseUrl()}/v1/chat/completions`, {
@@ -98,7 +140,7 @@ export class OpenAIAdapter implements ProviderAdapter {
       const errorText = await response.text();
       let payload;
       try { payload = JSON.parse(errorText); } catch { /* ignore */ }
-      throw new ProviderApiError(`OpenAI API error ${response.status}: ${errorText}`, response.status, payload);
+      throw new ProviderApiErrorClass(`OpenAI API error ${response.status}: ${errorText}`, response.status, payload);
     }
 
     const reader = response.body?.getReader();
@@ -106,6 +148,8 @@ export class OpenAIAdapter implements ProviderAdapter {
 
     const decoder = new TextDecoder();
     let buffer = '';
+    const msgId = `openai-${Date.now()}`;
+    let started = false;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -116,14 +160,40 @@ export class OpenAIAdapter implements ProviderAdapter {
       buffer = lines.pop() ?? '';
 
       for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const data = line.slice(6).trim();
-          if (data === '[DONE]') return;
-          try {
-            yield JSON.parse(data) as StreamChunk;
-          } catch (e) {
-            throw new ProviderApiError(`Failed to parse chunk: ${data}`, 500, { error: e });
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') {
+          yield { type: 'message_stop', stop_reason: 'stop' };
+          return;
+        }
+        try {
+          const chunk = JSON.parse(data);
+          if (!started) {
+            yield { type: 'message_start', id: chunk.id ?? msgId, model: request.model };
+            started = true;
           }
+          const delta = chunk.choices?.[0]?.delta;
+          if (delta?.content) {
+            yield { type: 'text_delta', text: delta.content, index: 0 };
+          }
+          if (delta?.reasoning_content) {
+            yield { type: 'thinking_delta', thinking: delta.reasoning_content, index: 0 };
+          }
+          if (delta?.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              if (tc.id) {
+                yield { type: 'tool_use_start', id: tc.id, name: tc.function?.name ?? '', index: tc.index };
+              }
+              if (tc.function?.arguments) {
+                yield { type: 'tool_use_delta', id: tc.id ?? '', partial_json: tc.function.arguments, index: tc.index };
+              }
+            }
+          }
+          if (chunk.choices?.[0]?.finish_reason) {
+            yield { type: 'message_stop', stop_reason: chunk.choices[0].finish_reason };
+          }
+        } catch (e) {
+          throw new ProviderApiErrorClass(`Failed to parse chunk: ${data}`, 500, { error: e });
         }
       }
     }
@@ -139,34 +209,125 @@ export class OpenAIAdapter implements ProviderAdapter {
 }
 
 // ══════════════════════════════════════════════
-// 入口转换器 — 透传（CCR 本身即 OpenAI 格式）
+// 入口转换器 — OpenAI → Unified 及反向
 // ══════════════════════════════════════════════
 
 export function createOpenAIEntryConverter(): EntryConverter {
   return {
     protocol: 'openai',
 
-    toInternal(body: Record<string, unknown>): ChatCompletionRequest {
+    toInternal(body: Record<string, unknown>): UnifiedRequest {
+      const msgs = (body.messages ?? []) as ChatCompletionRequest['messages'];
+      const tools = body.tools as Array<{ type: string; function: { name: string; description?: string; parameters?: Record<string, unknown> } }> | undefined;
+      const toolChoiceRaw = body.tool_choice as string | { type: string; function: { name: string } } | undefined;
+
+      let toolChoice: UnifiedRequest['tool_choice'];
+      if (typeof toolChoiceRaw === 'object') {
+        toolChoice = { type: 'tool', name: toolChoiceRaw.function.name };
+      } else if (toolChoiceRaw === 'auto' || toolChoiceRaw === 'none') {
+        toolChoice = toolChoiceRaw;
+      }
+
       return {
         model: (body.model as string) ?? '',
-        messages: (body.messages as ChatCompletionRequest['messages']) ?? [],
+        messages: chatMessagesToUnified(msgs),
         temperature: body.temperature as number | undefined,
         top_p: body.top_p as number | undefined,
         max_tokens: body.max_tokens as number | undefined,
         stream: body.stream as boolean | undefined,
-        stop: body.stop as string | string[] | undefined,
-        tools: body.tools as ChatCompletionRequest['tools'],
-        tool_choice: body.tool_choice as ChatCompletionRequest['tool_choice'],
-        response_format: body.response_format as ChatCompletionRequest['response_format'],
-        seed: body.seed as number | undefined,
-        presence_penalty: body.presence_penalty as number | undefined,
-        frequency_penalty: body.frequency_penalty as number | undefined,
-        user: body.user as string | undefined,
+        stop_sequences: (body.stop as string[]) ?? (typeof body.stop === 'string' ? [body.stop] : undefined),
+        tools: tools?.map(t => ({ name: t.function.name, description: t.function.description, parameters: t.function.parameters })),
+        tool_choice: toolChoice,
       };
     },
 
-    fromInternal(ccResp: ChatCompletionResponse): unknown { return ccResp; },
+    fromInternal(resp: UnifiedResponse): unknown {
+      const texts = blocksToText(resp.content);
+      const toolCalls = blocksToToolCalls(resp.content);
+      return {
+        id: resp.id,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: resp.model,
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: texts || null,
+            ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+          },
+          finish_reason: resp.stop_reason === 'tool_use' ? 'tool_calls' : 'stop',
+        }],
+        usage: {
+          prompt_tokens: resp.usage.input_tokens,
+          completion_tokens: resp.usage.output_tokens,
+          total_tokens: resp.usage.input_tokens + resp.usage.output_tokens,
+        },
+      };
+    },
 
-    transformStream(source: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> { return source; },
+    transformStream(source: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+      const encoder = new TextEncoder();
+      return new ReadableStream<Uint8Array>({
+        async start(controller) {
+          let msgId = '', model = '';
+          const created = Math.floor(Date.now() / 1000);
+          try {
+            for await (const event of parseUnifiedSSE(source)) {
+              switch (event.type) {
+                case 'message_start':
+                  msgId = event.id; model = event.model;
+                  break;
+                case 'text_delta':
+                  controller.enqueue(encoder.encode(
+                    `data: ${JSON.stringify({ id: msgId, object: 'chat.completion.chunk', created, model, choices: [{ index: event.index, delta: { content: event.text } }] })}\n\n`
+                  ));
+                  break;
+                case 'thinking_delta':
+                  controller.enqueue(encoder.encode(
+                    `data: ${JSON.stringify({ id: msgId, object: 'chat.completion.chunk', created, model, choices: [{ index: event.index, delta: { reasoning_content: event.thinking } }] })}\n\n`
+                  ));
+                  break;
+                case 'tool_use_start':
+                  controller.enqueue(encoder.encode(
+                    `data: ${JSON.stringify({ id: msgId, object: 'chat.completion.chunk', created, model, choices: [{ index: event.index, delta: { tool_calls: [{ index: 0, id: event.id, type: 'function', function: { name: event.name, arguments: '' } }] } }] })}\n\n`
+                  ));
+                  break;
+                case 'tool_use_delta':
+                  controller.enqueue(encoder.encode(
+                    `data: ${JSON.stringify({ id: msgId, object: 'chat.completion.chunk', created, model, choices: [{ index: event.index, delta: { tool_calls: [{ index: 0, function: { arguments: event.partial_json } }] } }] })}\n\n`
+                  ));
+                  break;
+                case 'message_stop': {
+                  const finishReason =
+                    event.stop_reason === 'tool_use' ? 'tool_calls' :
+                    event.stop_reason === 'max_tokens' ? 'length' : 'stop';
+                  const chunk: Record<string, unknown> = {
+                    id: msgId, object: 'chat.completion.chunk', created, model,
+                    choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+                  };
+                  if (event.usage) {
+                    chunk.usage = {
+                      prompt_tokens: event.usage.input_tokens,
+                      completion_tokens: event.usage.output_tokens,
+                      total_tokens: event.usage.input_tokens + event.usage.output_tokens,
+                    };
+                  }
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                  break;
+                }
+                // content_block_stop / message_start: no OpenAI visible chunk
+              }
+            }
+          } finally {
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+            controller.close();
+          }
+        },
+      });
+    },
   };
 }
+
+// Re-import for entry converter types
+import type { ChatCompletionRequest } from '../../types/api.js';

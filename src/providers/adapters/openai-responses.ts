@@ -1,82 +1,17 @@
-import {
-  ChatCompletionRequest,
-  ChatCompletionResponse,
-  StreamChunk,
-  ProviderHealth,
-  ProviderApiError
+import type {
+  UnifiedRequest, UnifiedResponse, UnifiedStreamEvent,
+  UnifiedMessage, UnifiedContentBlock, ProviderHealth,
 } from '../../types/api.js';
+import { ProviderApiError } from '../../types/api.js';
 import type { ProviderConfig } from '../../config/index.js';
 import type { ProviderAdapter, EntryConverter } from '../base.js';
-import {
-  createHealthCheck,
-  fetchModelsOpenAIFormat,
-} from '../base.js';
-import type { ChatMessage } from '../../types/api.js';
-
-/**
- * OpenAI Responses API Adapter (POST /v1/responses)
- *
- * Converts Chat Completions request format to Responses format,
- * and maps Responses API output back to Chat Completions response format.
- *
- * Key differences from Chat Completions:
- * - Endpoint: POST /v1/responses (not /chat/completions)
- * - Input: structured array of role/content items (not a flat string)
- * - System messages → "instructions"
- * - Tool messages → function_call_output items
- * - Output: response.output[].content[].text → choices[].message.content
- */
+import { createHealthCheck, fetchModelsOpenAIFormat } from '../base.js';
+import { parseUnifiedSSE } from '../unified-utils.js';
 
 type ResponsesInputItem =
   | { role: 'user' | 'assistant' | 'system' | 'developer'; content: string | Array<{ type: string; text?: string }> }
   | { type: 'function_call_output'; call_id: string; output: string }
   | { type: 'function_call'; call_id: string; name: string; arguments: string };
-
-interface ResponsesApiRequest {
-  model: string;
-  input: string | ResponsesInputItem[];
-  instructions?: string;
-  temperature?: number;
-  max_output_tokens?: number;
-  top_p?: number;
-  stream?: boolean;
-  tools?: Array<{ type: 'function'; name: string; description?: string; parameters?: Record<string, unknown> }>;
-}
-
-interface ResponsesApiResponse {
-  id: string;
-  object: 'response';
-  model: string;
-  output?: Array<{
-    type: string;
-    id?: string;
-    role?: string;
-    content?: Array<{
-      type: string;
-      text?: string;
-    }>;
-  }>;
-  incomplete_details?: {
-    reason?: string;
-  };
-  usage?: {
-    input_tokens: number;
-    output_tokens: number;
-    total_tokens: number;
-  };
-}
-
-/** Map Responses API incomplete_details.reason → Chat Completion finish_reason */
-function mapFinishReason(reason: string | undefined): 'stop' | 'length' | 'content_filter' | 'tool_calls' {
-  switch (reason) {
-    case 'max_output_tokens':
-      return 'length';
-    case 'content_filter':
-      return 'content_filter';
-    default:
-      return 'stop';
-  }
-}
 
 export class OpenAIResponsesAdapter implements ProviderAdapter {
   name: string;
@@ -86,272 +21,130 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
     this.name = config.name;
   }
 
-  private getBaseUrl(): string {
-    return this.config.base_url ?? 'https://api.openai.com';
-  }
+  private getBaseUrl(): string { return this.config.base_url ?? 'https://api.openai.com'; }
 
   private getHeaders(): Record<string, string> {
-    return {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${this.config.api_key ?? ''}`,
-    };
+    return { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.config.api_key ?? ''}` };
   }
 
-  // ---- Chat → Responses request mapping ----
-
-  private toResponsesRequest(req: ChatCompletionRequest, stream: boolean): ResponsesApiRequest {
-    // Extract system messages → instructions
+  private toResponsesRequest(req: UnifiedRequest): Record<string, unknown> {
     const systemMsgs = req.messages.filter(m => m.role === 'system');
     const instructions = systemMsgs.length > 0
-      ? systemMsgs.map(m => m.content ?? '').join('\n')
+      ? systemMsgs.flatMap(m => m.content.filter(b => b.type === 'text')).map(b => (b as { type: 'text'; text: string }).text).join('\n')
       : undefined;
 
-    // Build structured input items from non-system messages
     const inputItems: ResponsesInputItem[] = [];
-
     for (const m of req.messages) {
       if (m.role === 'system') continue;
-
       if (m.role === 'tool') {
-        // Tool message → function_call_output input item
-        inputItems.push({
-          type: 'function_call_output',
-          call_id: m.tool_call_id ?? '',
-          output: m.content ?? '',
-        });
-      } else if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0) {
-        // Assistant text content (if any non-empty)
-        if (m.content) {
-          inputItems.push({ role: 'assistant', content: m.content });
-        }
-        // Tool calls → function_call input items
-        for (const tc of m.tool_calls) {
-          inputItems.push({
-            type: 'function_call',
-            call_id: tc.id,
-            name: tc.function.name,
-            arguments: tc.function.arguments,
-          });
+        const text = m.content.filter(b => b.type === 'text').map(b => (b as { type: 'text'; text: string }).text).join('');
+        inputItems.push({ type: 'function_call_output', call_id: m.tool_call_id ?? '', output: text });
+      } else if (m.role === 'assistant') {
+        const texts = m.content.filter(b => b.type === 'text');
+        const toolUses = m.content.filter(b => b.type === 'tool_use');
+        if (texts.length > 0) inputItems.push({ role: 'assistant', content: texts.map(b => (b as { type: 'text'; text: string }).text).join('') });
+        for (const tu of toolUses) {
+          const t = tu as { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> };
+          inputItems.push({ type: 'function_call', call_id: t.id, name: t.name, arguments: JSON.stringify(t.input) });
         }
       } else {
-        // User/assistant message: send as structured role/content item
-        inputItems.push({
-          role: m.role as 'user' | 'assistant',
-          content: m.content ?? '',
-        });
+        const text = m.content.filter(b => b.type === 'text').map(b => (b as { type: 'text'; text: string }).text).join('');
+        inputItems.push({ role: m.role as 'user' | 'assistant', content: text });
       }
     }
 
-    const request: ResponsesApiRequest = {
-      model: req.model,
-      input: inputItems.length > 0 ? inputItems : '',
-      stream,
+    const request: Record<string, unknown> = {
+      model: req.model, input: inputItems.length > 0 ? inputItems : '', stream: false,
     };
-
     if (instructions) request.instructions = instructions;
     if (req.temperature !== undefined) request.temperature = req.temperature;
     if (req.max_tokens !== undefined) request.max_output_tokens = req.max_tokens;
     if (req.top_p !== undefined) request.top_p = req.top_p;
-
-    // Pass tools if present
-    if (req.tools && req.tools.length > 0) {
-      request.tools = req.tools.map(t => ({
-        type: 'function' as const,
-        name: t.function.name,
-        description: t.function.description,
-        parameters: t.function.parameters,
-      }));
+    if (req.tools?.length) {
+      request.tools = req.tools.map(t => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters }));
     }
-
     return request;
   }
 
-  // ---- Responses → Chat response mapping ----
+  async send(request: UnifiedRequest): Promise<UnifiedResponse> {
+    const body = this.toResponsesRequest(request);
+    const response = await fetch(`${this.getBaseUrl()}/v1/responses`, {
+      method: 'POST', headers: this.getHeaders(), body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const errText = await response.text();
+      let payload; try { payload = JSON.parse(errText); } catch { /* ignore */ }
+      throw new ProviderApiError(`OpenAI Responses API error ${response.status}: ${errText}`, response.status, payload);
+    }
 
-  private fromResponsesResponse(resp: ResponsesApiResponse, model: string): ChatCompletionResponse {
-    // Find the first message output
-    const messageOutput = resp.output?.find(o => o.type === 'message');
-    const content = messageOutput?.content
-      ?.filter(c => c.type === 'output_text')
-      .map(c => c.text ?? '')
-      .join('') ?? '';
+    const data = await response.json() as {
+      id?: string;
+      output?: Array<{ type: string; id?: string; name?: string; content?: Array<{ type: string; text?: string }> }>;
+      usage?: { input_tokens: number; output_tokens: number };
+    };
+
+    const content: UnifiedContentBlock[] = [];
+    for (const out of data.output ?? []) {
+      if (out.type === 'message') {
+        for (const c of out.content ?? []) {
+          if (c.type === 'output_text') content.push({ type: 'text', text: c.text ?? '' });
+        }
+      } else if (out.type === 'function_call') {
+        let input: Record<string, unknown> = {};
+        try { input = JSON.parse((out as unknown as { arguments?: string }).arguments ?? '{}'); } catch { /* ignore */ }
+        content.push({ type: 'tool_use', id: out.id ?? '', name: out.name ?? '', input });
+      }
+    }
 
     return {
-      id: resp.id,
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [
-        {
-          index: 0,
-          message: {
-            role: 'assistant',
-            content: content || null,
-          },
-          finish_reason: mapFinishReason(resp.incomplete_details?.reason),
-        },
-      ],
-      usage: {
-        prompt_tokens: resp.usage?.input_tokens ?? 0,
-        completion_tokens: resp.usage?.output_tokens ?? 0,
-        total_tokens: resp.usage?.total_tokens ?? 0,
-      },
+      id: data.id ?? `resp-${Date.now()}`, model: request.model, content,
+      stop_reason: 'stop',
+      usage: { input_tokens: data.usage?.input_tokens ?? 0, output_tokens: data.usage?.output_tokens ?? 0 },
     };
   }
 
-  // ---- ProviderAdapter implementation ----
-
-  async send(request: ChatCompletionRequest): Promise<ChatCompletionResponse> {
-    const body = this.toResponsesRequest(request, false);
-
-    const response = await fetch(`${this.getBaseUrl()}/v1/responses`, {
-      method: 'POST',
-      headers: this.getHeaders(),
-      body: JSON.stringify(body),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      let payload;
-      try { payload = JSON.parse(errorText); } catch { /* ignore */ }
-      throw new ProviderApiError(`Responses API error ${response.status}: ${errorText}`, response.status, payload);
-    }
-
-    const resp = await response.json() as ResponsesApiResponse;
-    return this.fromResponsesResponse(resp, request.model);
-  }
-
-  async *sendStreaming(request: ChatCompletionRequest): AsyncGenerator<StreamChunk> {
-    const body = this.toResponsesRequest(request, true);
+  async *sendStreaming(request: UnifiedRequest): AsyncGenerator<UnifiedStreamEvent> {
+    const body = this.toResponsesRequest(request);
+    (body as Record<string, unknown>).stream = true;
 
     const response = await fetch(`${this.getBaseUrl()}/v1/responses`, {
-      method: 'POST',
-      headers: this.getHeaders(),
-      body: JSON.stringify(body),
+      method: 'POST', headers: this.getHeaders(), body: JSON.stringify(body),
     });
-
     if (!response.ok) {
-      const errorText = await response.text();
-      let payload;
-      try { payload = JSON.parse(errorText); } catch { /* ignore */ }
-      throw new ProviderApiError(`Responses API error ${response.status}: ${errorText}`, response.status, payload);
+      const errText = await response.text();
+      let payload; try { payload = JSON.parse(errText); } catch { /* ignore */ }
+      throw new ProviderApiError(`OpenAI Responses API error ${response.status}: ${errText}`, response.status, payload);
     }
 
     const reader = response.body?.getReader();
     if (!reader) throw new Error('No response body');
-
     const decoder = new TextDecoder();
     let buffer = '';
-    const chunkId = `chatcmpl-${Math.random().toString(36).slice(2, 11)}`;
-    const created = Math.floor(Date.now() / 1000);
-    let model = request.model;
-    let streamCompleted = false; // track if response.completed was seen
-    let inputTokens = 0;
-    let outputTokens = 0;
-    let totalTokens = 0;
+    const msgId = `resp-${Date.now()}`;
+    let started = false;
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-
       buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-
+      const lines = buffer.split('\n'); buffer = lines.pop() ?? '';
       for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-
-        // Responses API SSE format: "data: {...}" (may also have "event: ..." lines)
-        if (trimmed.startsWith('event: ')) continue; // event line — handled by data payload
-
-        if (trimmed.startsWith('data: ')) {
-          const data = trimmed.slice(6).trim();
-          if (data === '[DONE]') {
-            streamCompleted = true;
-            break;
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') { yield { type: 'message_stop', stop_reason: 'stop' }; return; }
+        try {
+          const event = JSON.parse(data);
+          if (!started) { yield { type: 'message_start', id: msgId, model: request.model }; started = true; }
+          // Responses API stream format: content_part.added, text.delta, etc.
+          if (event.type === 'response.output_text.delta') {
+            yield { type: 'text_delta', text: event.delta ?? '', index: 0 };
+          } else if (event.type === 'response.completed') {
+            yield { type: 'message_stop', stop_reason: 'stop' };
           }
-
-          try {
-            const parsed = JSON.parse(data);
-
-            // response.output_text.delta — text delta chunk
-            if (parsed.type === 'response.output_text.delta' && parsed.delta) {
-              const chunk: StreamChunk = {
-                id: chunkId,
-                object: 'chat.completion.chunk',
-                created,
-                model: parsed.response?.model ?? model,
-                choices: [
-                  {
-                    index: 0,
-                    delta: { content: parsed.delta },
-                  },
-                ],
-              };
-              yield chunk;
-            }
-
-            // response.completed — final chunk with usage
-            if (parsed.type === 'response.completed' && parsed.response) {
-              streamCompleted = true;
-              const r = parsed.response as ResponsesApiResponse;
-              if (r.model) model = r.model;
-              if (r.usage) {
-                inputTokens = r.usage.input_tokens;
-                outputTokens = r.usage.output_tokens;
-                totalTokens = r.usage.total_tokens;
-              }
-
-              const finalChunk: StreamChunk = {
-                id: chunkId,
-                object: 'chat.completion.chunk',
-                created,
-                model,
-                choices: [
-                  {
-                    index: 0,
-                    delta: {},
-                    finish_reason: 'stop',
-                  },
-                ],
-                usage: {
-                  prompt_tokens: inputTokens,
-                  completion_tokens: outputTokens,
-                  total_tokens: totalTokens,
-                },
-              };
-              yield finalChunk;
-            }
-          } catch (e) {
-            throw new ProviderApiError(`Failed to parse Responses API SSE chunk: ${data}`, 500, { error: e });
-          }
+        } catch (e) {
+          throw new ProviderApiError(`Failed to parse Responses SSE chunk`, 500, { error: e });
         }
       }
-
-      if (streamCompleted) break;
-    }
-
-    // Fallback: if stream ended without response.completed, emit a final chunk
-    if (!streamCompleted) {
-      yield {
-        id: chunkId,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [
-          {
-            index: 0,
-            delta: {},
-            finish_reason: 'stop',
-          },
-        ],
-        usage: {
-          prompt_tokens: inputTokens,
-          completion_tokens: outputTokens,
-          total_tokens: totalTokens,
-        },
-      };
     }
   }
 
@@ -365,222 +158,89 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
 }
 
 // ═══════════════════════════════════════════════
-// 入口转换器 — Responses request → CCR 及反向
+// 入口转换器 — OpenAI Responses ↔ Unified
 // ═══════════════════════════════════════════════
 
 export function createResponsesEntryConverter(): EntryConverter {
   return {
     protocol: 'openai_responses',
 
-    toInternal(body: Record<string, unknown>): ChatCompletionRequest {
-      const msgs: ChatMessage[] = [];
+    toInternal(body: Record<string, unknown>): UnifiedRequest {
+      const inputRaw = body.input as string | Array<{ role: string; content: string }> | undefined;
+      const msgs: UnifiedMessage[] = [];
       const instructions = body.instructions as string | undefined;
-      if (instructions) msgs.push({ role: 'system', content: instructions });
+      if (instructions) msgs.push({ role: 'system', content: [{ type: 'text', text: instructions }] });
 
-      if (typeof body.input === 'string') {
-        if (body.input) msgs.push({ role: 'user', content: body.input });
-      } else if (Array.isArray(body.input)) {
-        for (const item of body.input as Array<Record<string, unknown>>) {
-          if (item.type === 'function_call_output') {
-            msgs.push({
-              role: 'tool',
-              tool_call_id: (item.call_id as string) ?? '',
-              content: (item.output as string) ?? '',
-            });
-          } else if (item.role === 'assistant' && item.tool_calls) {
-            msgs.push({
-              role: 'assistant',
-              content: (item.content as string) || null,
-              tool_calls: item.tool_calls as ChatMessage['tool_calls'],
-            });
-          } else {
-            const role = (item.role as string) === 'assistant' ? 'assistant' : 'user';
-            const content = typeof item.content === 'string' ? item.content
-              : Array.isArray(item.content) ? (item.content as Array<{ text?: string }>).map(c => c.text ?? '').join('')
-              : '';
-            if (content || item.tool_calls) {
-              msgs.push({
-                role,
-                content: content || null,
-                ...(item.tool_calls ? { tool_calls: item.tool_calls as ChatMessage['tool_calls'] } : {}),
-              });
-            }
-          }
+      if (Array.isArray(inputRaw)) {
+        for (const item of inputRaw) {
+          if (typeof item === 'string') continue;
+          msgs.push({ role: (item.role as UnifiedMessage['role']) ?? 'user', content: [{ type: 'text', text: item.content ?? '' }] });
         }
+      } else if (typeof inputRaw === 'string') {
+        msgs.push({ role: 'user', content: [{ type: 'text', text: inputRaw }] });
       }
 
-      const rawTools = body.tools as Array<Record<string, unknown>> | undefined;
       return {
         model: (body.model as string) ?? '', messages: msgs,
         temperature: body.temperature as number | undefined,
-        top_p: body.top_p as number | undefined,
         max_tokens: body.max_output_tokens as number | undefined,
+        top_p: body.top_p as number | undefined,
         stream: body.stream as boolean | undefined,
-        tools: rawTools?.map(t => ({ type: 'function' as const, function: { name: (t.name as string) ?? '', description: t.description as string | undefined, parameters: t.parameters as Record<string, unknown> | undefined } })),
-        provider_options: { previous_response_id: body.previous_response_id, text_format: (body as Record<string, unknown>).text },
       };
     },
 
-    fromInternal(ccResp: ChatCompletionResponse) {
-      const text = ccResp.choices[0]?.message?.content ?? '';
-      const finishReason = ccResp.choices[0]?.finish_reason;
+    fromInternal(resp: UnifiedResponse): unknown {
+      const texts = resp.content.filter(b => b.type === 'text').map(b => (b as { type: 'text'; text: string }).text).join('');
       return {
-        id: ccResp.id, object: 'response', model: ccResp.model,
-        created_at: ccResp.created,
-        status: 'completed' as const,
-        output: [{ type: 'message', id: `msg_${Math.random().toString(36).slice(2, 9)}`, status: 'completed' as const, role: 'assistant', content: [{ type: 'output_text', text }] }],
-        incomplete_details: { reason: finishReason === 'length' ? 'max_output_tokens' : 'stop' },
-        usage: { input_tokens: ccResp.usage?.prompt_tokens ?? 0, output_tokens: ccResp.usage?.completion_tokens ?? 0, total_tokens: ccResp.usage?.total_tokens ?? 0 },
+        id: resp.id, object: 'response', model: resp.model,
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: texts }] }],
+        usage: { input_tokens: resp.usage.input_tokens, output_tokens: resp.usage.output_tokens, total_tokens: resp.usage.input_tokens + resp.usage.output_tokens },
       };
     },
 
-    transformStream(source: ReadableStream<Uint8Array>, model: string): ReadableStream<Uint8Array> {
-      const encoder = new TextEncoder(); const decoder = new TextDecoder();
-      const responseId = `resp_${Math.random().toString(36).slice(2, 11)}`;
-      const itemId = `msg_${Math.random().toString(36).slice(2, 11)}`;
+    transformStream(source: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+      const encoder = new TextEncoder();
       return new ReadableStream<Uint8Array>({
         async start(controller) {
-          const reader = source.getReader(); let buffer = ''; let finished = false;
-          let itemStarted = false;
-          let contentPartStarted = false;
-          let reasoningStarted = false;
-          let accumulatedText = '';
-          let accumulatedReasoning = '';
-          let lastUsage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null = null;
-
-          const emit = (event: string, data: unknown) => {
-            controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
-          };
-
-          function ensureItemStarted(): void {
-            if (itemStarted) return;
-            itemStarted = true;
-            emit('response.output_item.added', { type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: itemId, status: 'in_progress', role: 'assistant', content: [] } });
-          }
-
-          function ensureContentPartStarted(): void {
-            if (contentPartStarted) return;
-            // Close reasoning part before opening text part (they share the message item)
-            if (reasoningStarted) {
-              emit('response.reasoning_text.done', { type: 'response.reasoning_text.done', item_id: itemId, output_index: 0, content_index: 0, text: accumulatedReasoning });
-              emit('response.content_part.done', { type: 'response.content_part.done', item_id: itemId, output_index: 0, content_index: 0, part: { type: 'reasoning', text: accumulatedReasoning } });
-              reasoningStarted = false;
-            }
-            ensureItemStarted();
-            contentPartStarted = true;
-            emit('response.content_part.added', { type: 'response.content_part.added', item_id: itemId, output_index: 0, content_index: 0, part: { type: 'output_text', text: '' } });
-          }
-
-          function ensureReasoningStarted(): void {
-            if (reasoningStarted) return;
-            // Close text part before opening reasoning part
-            if (contentPartStarted) {
-              emit('response.output_text.done', { type: 'response.output_text.done', item_id: itemId, output_index: 0, content_index: 0, text: accumulatedText });
-              emit('response.content_part.done', { type: 'response.content_part.done', item_id: itemId, output_index: 0, content_index: 0, part: { type: 'output_text', text: accumulatedText } });
-              contentPartStarted = false;
-            }
-            ensureItemStarted();
-            reasoningStarted = true;
-            emit('response.content_part.added', { type: 'response.content_part.added', item_id: itemId, output_index: 0, content_index: 0, part: { type: 'reasoning', text: '' } });
-          }
-
-          // Build the final output content array for response.completed
-          function buildOutputContent(): Array<{ type: string; text: string }> {
-            const parts: Array<{ type: string; text: string }> = [];
-            if (accumulatedReasoning) parts.push({ type: 'reasoning', text: accumulatedReasoning });
-            if (accumulatedText) parts.push({ type: 'output_text', text: accumulatedText });
-            return parts;
-          }
-
-          // emit response.created at the very beginning
-          emit('response.created', { type: 'response.created', response: { id: responseId, object: 'response', model, status: 'in_progress', output: [] } });
-
+          let msgId = '', model = '';
+          const created = Math.floor(Date.now() / 1000);
           try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              buffer += decoder.decode(value, { stream: true });
-              const lines = buffer.split('\n'); buffer = lines.pop() ?? '';
-              for (const line of lines) {
-                if (!line.startsWith('data: ')) continue;
-                const data = line.slice(6).trim();
-                if (data === '[DONE]') { finished = true; continue; }
-                try {
-                  const chunk = JSON.parse(data);
-                  const delta = chunk.choices?.[0]?.delta;
-                  const content = delta?.content;
-                  const reasoningContent = delta?.reasoning_content;
-                  const finishReason = chunk.choices?.[0]?.finish_reason;
+            for await (const event of parseUnifiedSSE(source)) {
+              switch (event.type) {
+                case 'message_start':
+                  msgId = event.id; model = event.model;
+                  controller.enqueue(encoder.encode(
+                    `event: response.created\ndata: ${JSON.stringify({ type: 'response.created', response: { id: msgId, object: 'response', created_at: created, status: 'in_progress', model } })}\n\n`
+                  ));
+                  break;
 
-                  // Track usage from any chunk that carries it
-                  if (chunk.usage) {
-                    lastUsage = {
-                      prompt_tokens: chunk.usage.prompt_tokens ?? 0,
-                      completion_tokens: chunk.usage.completion_tokens ?? 0,
-                      total_tokens: chunk.usage.total_tokens ?? 0,
+                case 'text_delta':
+                  controller.enqueue(encoder.encode(
+                    `event: response.output_text.delta\ndata: ${JSON.stringify({ type: 'response.output_text.delta', item_id: msgId, output_index: event.index, content_index: 0, delta: event.text })}\n\n`
+                  ));
+                  break;
+
+                case 'message_stop': {
+                  const payload: Record<string, unknown> = {
+                    type: 'response.completed',
+                    response: { id: msgId, object: 'response', created_at: created, status: 'completed', model },
+                  };
+                  if (event.usage) {
+                    (payload.response as Record<string, unknown>).usage = {
+                      input_tokens: event.usage.input_tokens,
+                      output_tokens: event.usage.output_tokens,
+                      total_tokens: event.usage.input_tokens + event.usage.output_tokens,
                     };
                   }
-
-                  // Handle reasoning/thinking content first
-                  if (reasoningContent !== undefined && reasoningContent !== null) {
-                    ensureReasoningStarted();
-                    accumulatedReasoning += reasoningContent;
-                    emit('response.reasoning_text.delta', { type: 'response.reasoning_text.delta', item_id: itemId, output_index: 0, content_index: 0, delta: reasoningContent });
-                  }
-
-                  // Handle regular text content
-                  if (content !== undefined && content !== null) {
-                    ensureContentPartStarted();
-                    accumulatedText += content;
-                    emit('response.output_text.delta', { type: 'response.output_text.delta', item_id: itemId, output_index: 0, content_index: 0, delta: content });
-                  }
-
-                  if (finishReason) {
-                    // Close any open reasoning part
-                    if (reasoningStarted) {
-                      emit('response.reasoning_text.done', { type: 'response.reasoning_text.done', item_id: itemId, output_index: 0, content_index: 0, text: accumulatedReasoning });
-                      emit('response.content_part.done', { type: 'response.content_part.done', item_id: itemId, output_index: 0, content_index: 0, part: { type: 'reasoning', text: accumulatedReasoning } });
-                      reasoningStarted = false;
-                    }
-                    // Close any open text part
-                    if (contentPartStarted) {
-                      emit('response.output_text.done', { type: 'response.output_text.done', item_id: itemId, output_index: 0, content_index: 0, text: accumulatedText });
-                      emit('response.content_part.done', { type: 'response.content_part.done', item_id: itemId, output_index: 0, content_index: 0, part: { type: 'output_text', text: accumulatedText } });
-                      contentPartStarted = false;
-                    }
-                    if (itemStarted) {
-                      const outputContent = buildOutputContent();
-                      emit('response.output_item.done', { type: 'response.output_item.done', output_index: 0, item: { type: 'message', id: itemId, status: 'completed', role: 'assistant', content: outputContent } });
-                      itemStarted = false;
-                    }
-                    finished = true;
-                    const outputContent = buildOutputContent();
-                    emit('response.completed', { type: 'response.completed', response: { id: responseId, object: 'response', model, status: 'completed', output: [{ type: 'message', id: itemId, status: 'completed', role: 'assistant', content: outputContent }], usage: lastUsage } });
-                  }
-                } catch { /* skip */ }
+                  controller.enqueue(encoder.encode(`event: response.completed\ndata: ${JSON.stringify(payload)}\n\n`));
+                  break;
+                }
               }
             }
-            // Fallback: if stream ended without finish_reason, emit completion events
-            if (!finished) {
-              if (reasoningStarted) {
-                emit('response.reasoning_text.done', { type: 'response.reasoning_text.done', item_id: itemId, output_index: 0, content_index: 0, text: accumulatedReasoning });
-                emit('response.content_part.done', { type: 'response.content_part.done', item_id: itemId, output_index: 0, content_index: 0, part: { type: 'reasoning', text: accumulatedReasoning } });
-                reasoningStarted = false;
-              }
-              if (contentPartStarted) {
-                emit('response.output_text.done', { type: 'response.output_text.done', item_id: itemId, output_index: 0, content_index: 0, text: accumulatedText });
-                emit('response.content_part.done', { type: 'response.content_part.done', item_id: itemId, output_index: 0, content_index: 0, part: { type: 'output_text', text: accumulatedText } });
-                contentPartStarted = false;
-              }
-              if (itemStarted) {
-                const outputContent = buildOutputContent();
-                emit('response.output_item.done', { type: 'response.output_item.done', output_index: 0, item: { type: 'message', id: itemId, status: 'completed', role: 'assistant', content: outputContent } });
-                itemStarted = false;
-              }
-              const outputContent = buildOutputContent();
-              emit('response.completed', { type: 'response.completed', response: { id: responseId, object: 'response', model, status: 'completed', output: [{ type: 'message', id: itemId, status: 'completed', role: 'assistant', content: outputContent }], usage: lastUsage } });
-            }
-          } finally { reader.releaseLock(); controller.close(); }
+          } finally {
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+            controller.close();
+          }
         },
       });
     },

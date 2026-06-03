@@ -1,4 +1,115 @@
-// 请求 / 响应类型（与 OpenAI API 保持一致）
+// ═══════════════════════════════════════════════════════════════════════
+// 协议无关的统一中间表示（Unified Intermediate Representation）
+// 所有入口协议先转为此格式，所有上游适配器从此格式转出。
+// Content block 数组模型 — 不偏向任何一方协议。
+// ═══════════════════════════════════════════════════════════════════════
+
+// ── Content Blocks ──
+
+export type UnifiedContentBlock =
+  | UnifiedTextBlock
+  | UnifiedImageBlock
+  | UnifiedToolUseBlock
+  | UnifiedToolResultBlock
+  | UnifiedThinkingBlock;
+
+export interface UnifiedTextBlock {
+  type: 'text';
+  text: string;
+}
+
+export interface UnifiedImageBlock {
+  type: 'image';
+  source: { data: string; media_type: string };
+}
+
+export interface UnifiedToolUseBlock {
+  type: 'tool_use';
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+export interface UnifiedToolResultBlock {
+  type: 'tool_result';
+  tool_use_id: string;
+  content: UnifiedContentBlock[];
+  is_error?: boolean;
+}
+
+export interface UnifiedThinkingBlock {
+  type: 'thinking';
+  thinking: string;
+  signature?: string;
+}
+
+// ── Messages ──
+
+export interface UnifiedMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: UnifiedContentBlock[];
+  /** tool 角色消息的关联 ID */
+  tool_call_id?: string;
+  /** tool 角色消息的函数名（Google/Ollama 需要） */
+  name?: string;
+}
+
+// ── Tools ──
+
+export interface UnifiedTool {
+  name: string;
+  description?: string;
+  parameters?: Record<string, unknown>; // JSON Schema
+}
+
+export type UnifiedToolChoice =
+  | 'auto'
+  | 'any'
+  | 'none'
+  | { type: 'tool'; name: string };
+
+// ── Request ──
+
+export interface UnifiedRequest {
+  model: string;
+  messages: UnifiedMessage[];
+  temperature?: number;
+  top_p?: number;
+  max_tokens?: number;
+  stream?: boolean;
+  stop_sequences?: string[];
+  tools?: UnifiedTool[];
+  tool_choice?: UnifiedToolChoice;
+  /** 协议特有参数透传 */
+  provider_options?: Record<string, unknown>;
+}
+
+// ── Response ──
+
+export interface UnifiedResponse {
+  id: string;
+  model: string;
+  content: UnifiedContentBlock[];
+  stop_reason: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' | 'stop';
+  usage: { input_tokens: number; output_tokens: number };
+}
+
+// ── Streaming ──
+
+export type UnifiedStreamEvent =
+  | { type: 'text_delta'; text: string; index: number }
+  | { type: 'thinking_delta'; thinking: string; index: number }
+  | { type: 'tool_use_start'; id: string; name: string; index: number }
+  | { type: 'tool_use_delta'; id: string; partial_json: string; index: number }
+  | { type: 'content_block_stop'; index: number }
+  | { type: 'message_start'; id: string; model: string }
+  | { type: 'message_stop'; stop_reason: string; usage?: { input_tokens: number; output_tokens: number } };
+
+// ═══════════════════════════════════════════════════════════════════════
+// 以下为各协议原生类型（入口/出口转换用）
+// ═══════════════════════════════════════════════════════════════════════
+
+// OpenAI 原生类型（兼容旧有 ChatCompletionRequest/Response，逐步迁移）
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -18,7 +129,7 @@ export interface ToolCall {
 }
 
 export interface ChatCompletionRequest {
-  model: string; // 格式: <provider>/<model_id>
+  model: string;
   messages: ChatMessage[];
   temperature?: number;
   top_p?: number;
@@ -32,7 +143,6 @@ export interface ChatCompletionRequest {
   presence_penalty?: number;
   frequency_penalty?: number;
   user?: string;
-  /** 协议特有参数透传（入口无法映射到 CCR 的字段暂存于此） */
   provider_options?: Record<string, unknown>;
 }
 
@@ -41,56 +151,7 @@ export interface ToolDefinition {
   function: {
     name: string;
     description?: string;
-    parameters?: Record<string, unknown>; // JSON Schema
-  };
-}
-
-export interface ChatCompletionChoice {
-  index: number;
-  message: {
-    role: 'assistant';
-    content: string | null;
-    tool_calls?: ToolCall[];
-  };
-  finish_reason: 'stop' | 'length' | 'content_filter' | 'tool_calls';
-}
-
-export interface ChatCompletionResponse {
-  id: string;
-  object: 'chat.completion';
-  created: number;
-  model: string;
-  choices: ChatCompletionChoice[];
-  usage: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-  };
-}
-
-export interface StreamChunk {
-  id: string;
-  object: 'chat.completion.chunk';
-  created: number;
-  model: string;
-  choices: Array<{
-    index: number;
-    delta: {
-      role?: 'assistant';
-      content?: string | null;
-      reasoning_content?: string | null;
-      tool_calls?: Array<{
-        index: number;
-        id?: string;
-        function?: { name?: string; arguments?: string };
-      }>;
-    };
-    finish_reason?: 'stop' | 'length' | 'content_filter' | 'tool_calls';
-  }>;
-  usage?: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
+    parameters?: Record<string, unknown>;
   };
 }
 
@@ -132,7 +193,7 @@ export interface AnthropicMessageResponse {
     input?: Record<string, unknown>;
   }>;
   model: string;
-  stop_reason: 'end_turn' | 'max_tokens' | 'stop_sequence';
+  stop_reason: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use';
   stop_sequence: string | null;
   usage: {
     input_tokens: number;
@@ -141,18 +202,6 @@ export interface AnthropicMessageResponse {
 }
 
 // ===== Google Gemini 原生类型 =====
-
-export interface GoogleRequest {
-  contents: Array<{ role: 'user' | 'model'; parts: Array<{ text?: string }> }>;
-  systemInstruction?: { parts: Array<{ text: string }> };
-  generationConfig?: {
-    temperature?: number;
-    topP?: number;
-    maxOutputTokens?: number;
-    stopSequences?: string[];
-  };
-  safetySettings?: Array<{ category: string; threshold: string }>;
-}
 
 export interface GoogleResponse {
   candidates?: Array<{
@@ -164,53 +213,6 @@ export interface GoogleResponse {
     candidatesTokenCount?: number;
     totalTokenCount?: number;
   };
-}
-
-// ===== Ollama 原生类型 =====
-
-export interface OllamaRequest {
-  model: string;
-  messages: Array<{ role: string; content: string }>;
-  stream?: boolean;
-  options?: {
-    temperature?: number;
-    top_p?: number;
-    num_predict?: number;
-    stop?: string[];
-  };
-}
-
-export interface OllamaResponse {
-  model: string;
-  message: { role: string; content: string };
-  done: boolean;
-  total_duration?: number;
-}
-
-// ===== OpenAI Responses 原生类型 =====
-
-export interface ResponsesRequest {
-  model: string;
-  input: string | Array<{ role: string; content: string }>;
-  instructions?: string;
-  temperature?: number;
-  max_output_tokens?: number;
-  top_p?: number;
-  stream?: boolean;
-  previous_response_id?: string;
-  text?: { format?: { type: 'text' | 'json_object' | 'json_schema'; name?: string; schema?: Record<string, unknown> } };
-  tools?: Array<{ type: 'function'; name: string; description?: string; parameters?: Record<string, unknown> }>;
-}
-
-// 模型列表
-export interface ModelInfo {
-  id: string; // <provider>/<model_id>
-  object: 'model';
-  created: number;
-  owned_by: string;
-  provider: string; // 配置中的 provider 别名
-  provider_type: string; // openai / anthropic / ollama / google
-  model_id: string; // provider 端的实际模型名
 }
 
 // Provider 健康状态

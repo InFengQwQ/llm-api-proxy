@@ -3,7 +3,7 @@ import { Router } from './router/index.js';
 import { getDb } from './db/index.js';
 import { type RequestLogger } from './middleware/request-logger.js';
 import { entryConverters } from './providers/index.js';
-import type { ChatCompletionResponse } from './types/api.js';
+import type { UnifiedResponse } from './types/api.js';
 
 export function createApp(router: Router, requestLogger?: RequestLogger) {
   const app = express();
@@ -50,14 +50,13 @@ export function createApp(router: Router, requestLogger?: RequestLogger) {
     requestId: string,
     model: string,
     errorMessage: string,
-  ): ChatCompletionResponse {
+  ): UnifiedResponse {
     return {
       id: requestId,
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
       model,
-      choices: [{ index: 0, message: { role: 'assistant', content: errorMessage }, finish_reason: 'stop' }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      content: [{ type: 'text', text: errorMessage }],
+      stop_reason: 'stop',
+      usage: { input_tokens: 0, output_tokens: 0 },
     };
   }
 
@@ -98,7 +97,6 @@ export function createApp(router: Router, requestLogger?: RequestLogger) {
           if (data.error) {
             const nativeErr = converter.fromInternal(
               buildUpstreamError(requestId, ccRequest.model, data.error.message),
-              ccRequest.model,
             );
             res.status(upstreamResponse.status).set('X-Request-Id', requestId).json(nativeErr);
           } else {
@@ -106,7 +104,7 @@ export function createApp(router: Router, requestLogger?: RequestLogger) {
           }
           return;
         }
-        const nativeStream = converter.transformStream(upstreamResponse.body!, ccRequest.model);
+        const nativeStream = converter.transformStream(upstreamResponse.body!);
         pipeStream(nativeStream, res);
         return;
       }
@@ -116,12 +114,11 @@ export function createApp(router: Router, requestLogger?: RequestLogger) {
       if (ccResp.error) {
         const nativeErr = converter.fromInternal(
           buildUpstreamError(requestId, ccRequest.model, ccResp.error.message),
-          ccRequest.model,
         );
         res.status(upstreamResponse.status).set('X-Request-Id', requestId).json(nativeErr);
         return;
       }
-      const nativeResp = converter.fromInternal(ccResp, ccRequest.model);
+      const nativeResp = converter.fromInternal(ccResp);
       res.status(upstreamResponse.status).set('X-Request-Id', requestId).json(nativeResp);
     } catch (err) {
       next(err);
