@@ -9,16 +9,10 @@ import {
 import type { AnthropicRequest, AnthropicContentBlock, ChatMessage } from '../../types/api.js';
 import type { ProviderConfig } from '../../config/index.js';
 import type { ProviderAdapter, EntryConverter } from '../base.js';
-
-// Anthropic content block type
-type ContentBlock = {
-  type: 'text' | 'tool_use' | 'thinking';
-  text?: string;
-  thinking?: string;
-  id?: string;
-  name?: string;
-  input?: Record<string, unknown>;
-};
+import {
+  createHealthCheck,
+  fetchModelsOpenAIFormat,
+} from '../base.js';
 
 export class AnthropicAdapter implements ProviderAdapter {
   name: string;
@@ -132,7 +126,7 @@ export class AnthropicAdapter implements ProviderAdapter {
     resp: AnthropicMessageResponse,
     model: string
   ): ChatCompletionResponse {
-    const parts = resp.content.map((block: ContentBlock) => {
+    const parts = resp.content.map((block) => {
       if (block.type === 'text') {
         return { role: 'assistant' as const, content: block.text ?? '' };
       }
@@ -379,44 +373,11 @@ export class AnthropicAdapter implements ProviderAdapter {
   }
 
   async health(): Promise<ProviderHealth> {
-    const start = Date.now();
-    try {
-      const response = await fetch(`${this.getBaseUrl()}/v1/models`, {
-        headers: {
-          ...this.getHeaders(),
-          'anthropic-version': '2023-06-01',
-        },
-        signal: AbortSignal.timeout(5000),
-      });
-      return {
-        provider: this.name,
-        status: response.ok ? 'healthy' : 'degraded',
-        latency_ms: Date.now() - start,
-        error_rate: response.ok ? 0 : 1,
-      };
-    } catch {
-      return {
-        provider: this.name,
-        status: 'unavailable',
-        latency_ms: Date.now() - start,
-        error_rate: 1,
-      };
-    }
+    return createHealthCheck(this.name, `${this.getBaseUrl()}/v1/models`, this.getHeaders());
   }
 
   async fetchModels(): Promise<string[]> {
-    const response = await fetch(`${this.getBaseUrl()}/v1/models`, {
-      headers: {
-        ...this.getHeaders(),
-        'anthropic-version': '2023-06-01',
-      },
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const data = await response.json() as { data?: Array<{ id?: string }> };
-    return (data.data ?? [])
-      .map(m => m.id)
-      .filter((id): id is string => typeof id === 'string');
+    return fetchModelsOpenAIFormat(`${this.getBaseUrl()}/v1/models`, this.getHeaders());
   }
 }
 

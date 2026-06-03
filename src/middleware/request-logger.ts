@@ -39,7 +39,12 @@ interface BodyCapture {
   };
 }
 
-// ---------- 工具函数 ----------
+// ── Constants ────────────────────────────────────────────────────────────
+
+/** Maximum raw body length to preserve before truncating (characters) */
+const MAX_RAW_BODY_LENGTH = 5000;
+
+// ── Utility Functions ────────────────────────────────────────────────────
 
 /** 生成 "YYYY-MM-DDTHH-mm-ss" 格式的时间戳目录名 */
 function startupDirName(): string {
@@ -130,7 +135,7 @@ function extractResponseBody(chunks: Buffer[], jsonBody: unknown): unknown {
   }
 
   // 非 SSE 流式内容，截断避免过大
-  const truncated = raw.length > 5000 ? raw.slice(0, 5000) + '...(truncated)' : raw;
+  const truncated = raw.length > MAX_RAW_BODY_LENGTH ? raw.slice(0, MAX_RAW_BODY_LENGTH) + '...(truncated)' : raw;
   try { return JSON.parse(truncated); } catch { return { _raw_body: truncated }; }
 }
 

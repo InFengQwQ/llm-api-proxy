@@ -7,6 +7,7 @@ import {
 } from '../../types/api.js';
 import type { ProviderConfig } from '../../config/index.js';
 import type { ProviderAdapter, EntryConverter } from '../base.js';
+import { createHealthCheck, fetchModelsGoogleFormat } from '../base.js';
 import type { ChatMessage, GoogleResponse } from '../../types/api.js';
 
 export class GoogleAdapter implements ProviderAdapter {
@@ -197,34 +198,11 @@ export class GoogleAdapter implements ProviderAdapter {
   }
 
   async health(): Promise<ProviderHealth> {
-    const start = Date.now();
-    try {
-      const url = `${this.getBaseUrl()}/v1beta/models?key=${this.config.api_key ?? ''}`;
-      const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
-      return {
-        provider: this.name,
-        status: response.ok ? 'healthy' : 'degraded',
-        latency_ms: Date.now() - start,
-        error_rate: response.ok ? 0 : 1,
-      };
-    } catch {
-      return {
-        provider: this.name,
-        status: 'unavailable',
-        latency_ms: Date.now() - start,
-        error_rate: 1,
-      };
-    }
+    return createHealthCheck(this.name, `${this.getBaseUrl()}/v1beta/models?key=${this.config.api_key ?? ''}`);
   }
 
   async fetchModels(): Promise<string[]> {
-    const url = `${this.getBaseUrl()}/v1beta/models?key=${this.config.api_key ?? ''}`;
-    const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const data = await response.json() as { models?: Array<{ name?: string }> };
-    return (data.models ?? [])
-      .map(m => m.name)
-      .filter((id): id is string => typeof id === 'string');
+    return fetchModelsGoogleFormat(`${this.getBaseUrl()}/v1beta/models?key=${this.config.api_key ?? ''}`);
   }
 }
 
@@ -307,7 +285,7 @@ export function createGoogleEntryConverter(): EntryConverter {
               }
             }
             if (!finished) controller.enqueue(encoder.encode(JSON.stringify({ candidates: [{ content: { parts: [{ text: '' }] }, finishReason: 'STOP' }] }) + '\n'));
-          } finally { reader.releaseLock(); controller.close(); }
+          } finally { controller.close(); reader.releaseLock(); }
         },
       });
     },

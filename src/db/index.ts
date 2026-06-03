@@ -73,3 +73,55 @@ export function closeDatabase(): void {
     db = null;
   }
 }
+
+// ---------------------------------------------------------------------------
+// 批量日志缓冲（模块级缓冲，减少 SQLite 写入频率）
+// ---------------------------------------------------------------------------
+
+interface PendingLog {
+  requestId: string;
+  model: string;
+  provider: string;
+  latency: number;
+  status: number;
+  error?: string;
+}
+
+const pendingLogs: PendingLog[] = [];
+
+function flushLogs(): void {
+  if (!pendingLogs.length) return;
+  const batch = pendingLogs.splice(0);
+  for (const l of batch) {
+    logRequest({
+      request_id: l.requestId,
+      model: l.model,
+      provider: l.provider,
+      latency_ms: l.latency,
+      status_code: l.status,
+      error_msg: l.error,
+    });
+  }
+}
+
+/** 异步记录请求日志（缓冲写入，攒 10 条刷盘一次） */
+export function logRequestAsync(
+  requestId: string,
+  model: string,
+  provider: string,
+  latency: number,
+  status: number,
+  error?: string,
+): void {
+  pendingLogs.push({ requestId, model, provider, latency, status, error });
+  if (pendingLogs.length >= 10) flushLogs();
+}
+
+// 每 5 秒定时刷盘，防止尾部日志丢失
+const flushIntervalId = setInterval(flushLogs, 5_000);
+
+/** 停止批量日志刷盘定时器并刷盘（用于优雅关闭） */
+export function stopLogBuffer(): void {
+  clearInterval(flushIntervalId);
+  flushLogs();
+}

@@ -7,6 +7,7 @@ import {
 } from '../../types/api.js';
 import type { ProviderConfig } from '../../config/index.js';
 import type { ProviderAdapter, EntryConverter } from '../base.js';
+import { createHealthCheck, fetchModelsGoogleFormat } from '../base.js';
 import type { OllamaResponse } from '../../types/api.js';
 
 export class OllamaAdapter implements ProviderAdapter {
@@ -202,36 +203,12 @@ export class OllamaAdapter implements ProviderAdapter {
   }
 
   async health(): Promise<ProviderHealth> {
-    const start = Date.now();
-    try {
-      const response = await fetch(`${this.getBaseUrl()}/api/tags`, {
-        signal: AbortSignal.timeout(5000),
-      });
-      return {
-        provider: this.name,
-        status: response.ok ? 'healthy' : 'degraded',
-        latency_ms: Date.now() - start,
-        error_rate: response.ok ? 0 : 1,
-      };
-    } catch {
-      return {
-        provider: this.name,
-        status: 'unavailable',
-        latency_ms: Date.now() - start,
-        error_rate: 1,
-      };
-    }
+    return createHealthCheck(this.name, `${this.getBaseUrl()}/api/tags`);
   }
 
   async fetchModels(): Promise<string[]> {
-    const response = await fetch(`${this.getBaseUrl()}/api/tags`, {
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const data = await response.json() as { models?: Array<{ name?: string }> };
-    return (data.models ?? [])
-      .map(m => m.name)
-      .filter((id): id is string => typeof id === 'string');
+    // Ollama uses /api/tags with { models: [{ name }] } — same shape as Google
+    return fetchModelsGoogleFormat(`${this.getBaseUrl()}/api/tags`);
   }
 }
 

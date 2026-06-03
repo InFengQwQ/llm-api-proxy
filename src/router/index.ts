@@ -4,7 +4,25 @@ import type { ProviderConfig, AutoRoutingConfig, AutoRoutingGroup } from '../con
 import type { ProviderAdapter } from '../providers/base.js';
 import { createAdapter, parseModelId } from '../providers/index.js';
 import { CircuitBreaker } from './circuit-breaker.js';
-import { logRequest } from '../db/index.js';
+import { logRequestAsync } from '../db/index.js';
+
+// ── Constants ────────────────────────────────────────────────────────────
+
+/** How long a model stays "hot" after rate-limiting (ms) */
+const MODEL_HEAT_COOLDOWN_MS = 60_000;
+/** Models are marked "warm" (partially recovered) after 2× cooldown */
+const MODEL_HEAT_WARM_FACTOR = 2;
+/** Number of consecutive 429s before a model is considered overheated */
+const MODEL_HEAT_OVERHEATED_THRESHOLD = 3;
+/** A model enters cooling when it has at least this many failures within cooldown */
+const MODEL_HEAT_COOLING_THRESHOLD = 2;
+
+/** Session stickiness TTL: how long a session stays bound to a target (ms) */
+const SESSION_TTL_MS = 10 * 60 * 1000;
+/** Model list cache TTL: how long fetched model lists are considered fresh (ms) */
+const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
+
+// ── Types ─────────────────────────────────────────────────────────────────
 
 type ProviderEntry = {
   config: ProviderConfig;
@@ -12,9 +30,9 @@ type ProviderEntry = {
   breaker: CircuitBreaker;
 };
 
-// 存储每对 (group, sub-model) 的连续失败次数（用于 429 动态降权）
+/** Per-model heat tracking: (group, sub-model) → consecutive failure count */
 type ModelHeatMap = Map<string, { failures: number; lastFailure: number }>;
-// 存储 (group, sessionId) -> { target, boundAt }（会话粘性）
+/** Session stickiness: (group, sessionId) → { target, boundAt } */
 type SessionMap = Map<string, { target: string; boundAt: number }>;
 
 export class Router {
@@ -24,12 +42,10 @@ export class Router {
   private autoRoutingMap = new Map<string, AutoRoutingGroup>();
   private modelHeat: ModelHeatMap = new Map();
   private sessionMap: SessionMap = new Map();
-  private sessionTtl = 10 * 60 * 1000; // 10 分钟会话粘性 TTL
   private pruneIntervalId: ReturnType<typeof setInterval> | null = null;
 
   /** 模型列表缓存：provider_name -> { models, fetchedAt } */
   private modelCache = new Map<string, { models: string[]; fetchedAt: number }>();
-  private modelCacheTtl = 5 * 60 * 1000; // 5 分钟缓存
 
   register(configs: ProviderConfig[]): void {
     for (const config of configs) {
@@ -41,7 +57,7 @@ export class Router {
       });
     }
     // 启动 session TTL 清理
-    this.pruneIntervalId = setInterval(() => this.pruneExpiredSessions(), this.sessionTtl);
+    this.pruneIntervalId = setInterval(() => this.pruneExpiredSessions(), SESSION_TTL_MS);
   }
 
   /** 清理定时器（用于优雅关闭） */
@@ -55,7 +71,7 @@ export class Router {
   private pruneExpiredSessions(): void {
     const now = Date.now();
     for (const [key, { boundAt }] of this.sessionMap) {
-      if (now - boundAt > this.sessionTtl) {
+      if (now - boundAt > SESSION_TTL_MS) {
         this.sessionMap.delete(key);
       }
     }
@@ -80,7 +96,7 @@ export class Router {
     }
 
     const cached = this.modelCache.get(providerName);
-    if (cached && Date.now() - cached.fetchedAt < this.modelCacheTtl) {
+    if (cached && Date.now() - cached.fetchedAt < MODEL_CACHE_TTL_MS) {
       return cached.models;
     }
 
@@ -105,6 +121,69 @@ export class Router {
       }).catch(() => {
         // fetchProviderModels 内部已处理错误
       });
+    }
+  }
+
+  /** Helper: build a JSON error Response with the standard error shape */
+  private errorResponse(message: string, type: string, status: number): Response {
+    return Response.json({ error: { message, type } }, { status });
+  }
+
+  /**
+   * Look up a provider entry by full model ID (e.g. "openai/gpt-4o").
+   * Returns the entry or an error Response if the provider is missing or its circuit is open.
+   */
+  private resolveProvider(
+    fullModelId: string,
+  ): { entry: ProviderEntry; modelId: string } | { error: Response } {
+    const { provider_name, model_id } = parseModelId(fullModelId);
+    const entry = this.providers.get(provider_name);
+    if (!entry) {
+      return {
+        error: this.errorResponse(
+          `Provider "${provider_name}" not found`,
+          'invalid_request_error',
+          400,
+        ),
+      };
+    }
+    if (!entry.breaker.canExecute()) {
+      return {
+        error: this.errorResponse(
+          `Provider "${provider_name}" is currently unavailable (circuit open)`,
+          'service_unavailable',
+          503,
+        ),
+      };
+    }
+    return { entry, modelId: model_id };
+  }
+
+  /**
+   * Execute a non-streaming request against a provider target.
+   * Returns a Response (success or error), records circuit breaker state and logs.
+   */
+  private async executeNonStreaming(
+    entry: ProviderEntry,
+    request: ChatCompletionRequest,
+    modelId: string,
+    providerName: string,
+    requestId: string,
+    extraHeaders?: Record<string, string>,
+  ): Promise<Response> {
+    const startTime = Date.now();
+    try {
+      const result = await entry.adapter.send(request);
+      entry.breaker.recordSuccess();
+      logRequestAsync(requestId, modelId, providerName, Date.now() - startTime, 200);
+      return Response.json(result, { headers: { 'X-Provider': providerName, ...extraHeaders } });
+    } catch (err) {
+      entry.breaker.recordFailure();
+      const latency = Date.now() - startTime;
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      const status = this.errorStatus(err);
+      logRequestAsync(requestId, modelId, providerName, latency, status, errorMsg);
+      return this.errorResponse(errorMsg, 'upstream_error', status);
     }
   }
 
@@ -174,14 +253,14 @@ export class Router {
   private isModelOverheated(target: string): boolean {
     const heat = this.modelHeat.get(target);
     if (!heat) return false;
-    const cooldown = 60_000; // 1 分钟冷却
-    if (Date.now() - heat.lastFailure < cooldown && heat.failures >= 2) return true;
-    // 热度随时间衰减
-    if (heat.failures > 0 && Date.now() - heat.lastFailure >= cooldown * 2) {
+    // Model is cooling: has recent failures, should be skipped temporarily
+    if (Date.now() - heat.lastFailure < MODEL_HEAT_COOLDOWN_MS && heat.failures >= MODEL_HEAT_COOLING_THRESHOLD) return true;
+    // Heat naturally decays after 2× cooldown period
+    if (heat.failures > 0 && Date.now() - heat.lastFailure >= MODEL_HEAT_COOLDOWN_MS * MODEL_HEAT_WARM_FACTOR) {
       heat.failures = Math.floor(heat.failures / 2);
       heat.lastFailure = Date.now();
     }
-    return heat.failures >= 3;
+    return heat.failures >= MODEL_HEAT_OVERHEATED_THRESHOLD;
   }
 
   private markModelHeat(target: string): void {
@@ -212,51 +291,26 @@ export class Router {
       return this.routeAuto(autoMeta.group, request, requestId, autoMeta.sessionId ?? sessionId);
     }
 
-    // 原有直接路由逻辑
-    const { provider_name, model_id } = parseModelId(fullModelId);
+    // 直接路由
+    const resolved = this.resolveProvider(fullModelId);
+    if ('error' in resolved) return resolved.error;
 
-    const entry = this.providers.get(provider_name);
-    if (!entry) {
-      return Response.json(
-        { error: { message: `Provider "${provider_name}" not found`, type: 'invalid_request_error' } },
-        { status: 400 }
-      );
+    const { entry, modelId } = resolved;
+    const providerName = entry.config.name;
+    const modifiedRequest = { ...request, model: modelId };
+
+    if (request.stream) {
+      const body = this.streamToReadableStream(entry, modifiedRequest, fullModelId, providerName, requestId);
+      return new Response(body, {
+        headers: {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache',
+          'X-Provider': providerName,
+        },
+      });
     }
 
-    if (!entry.breaker.canExecute()) {
-      return Response.json(
-        { error: { message: `Provider "${provider_name}" is currently unavailable (circuit open)`, type: 'service_unavailable' } },
-        { status: 503 }
-      );
-    }
-
-    const modifiedRequest = { ...request, model: model_id };
-    const startTime = Date.now();
-
-    try {
-      if (request.stream) {
-        const body = this.streamToReadableStream(entry, modifiedRequest, fullModelId, provider_name, requestId);
-        return new Response(body, {
-          headers: {
-            'Content-Type': 'text/event-stream; charset=utf-8',
-            'Cache-Control': 'no-cache',
-            'X-Provider': provider_name,
-          },
-        });
-      }
-
-      const result = await entry.adapter.send(modifiedRequest);
-      entry.breaker.recordSuccess();
-      logRequestAsync(requestId, fullModelId, provider_name, Date.now() - startTime, 200);
-      return Response.json(result, { headers: { 'X-Provider': provider_name } });
-    } catch (err) {
-      entry.breaker.recordFailure();
-      const latency = Date.now() - startTime;
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      const status = this.errorStatus(err);
-      logRequestAsync(requestId, fullModelId, provider_name, latency, status, errorMsg);
-      return Response.json({ error: { message: errorMsg, type: 'upstream_error' } }, { status });
-    }
+    return this.executeNonStreaming(entry, modifiedRequest, fullModelId, providerName, requestId);
   }
 
   private async routeAuto(
@@ -267,9 +321,10 @@ export class Router {
   ): Promise<Response> {
     const groupConfig = this.autoRoutingMap.get(group);
     if (!groupConfig) {
-      return Response.json(
-        { error: { message: `Auto routing group "${group}" not found`, type: 'invalid_request_error' } },
-        { status: 400 }
+      return this.errorResponse(
+        `Auto routing group "${group}" not found`,
+        'invalid_request_error',
+        400,
       );
     }
 
@@ -302,9 +357,10 @@ export class Router {
       continue;
     }
 
-    return Response.json(
-      { error: { message: `All models in auto group "${group}" are unavailable or rate-limited`, type: 'service_unavailable' } },
-      { status: 503 }
+    return this.errorResponse(
+      `All models in auto group "${group}" are unavailable or rate-limited`,
+      'service_unavailable',
+      503,
     );
   }
 
@@ -313,66 +369,68 @@ export class Router {
     request: ChatCompletionRequest,
     requestId: string
   ): Promise<Response> {
-    const { provider_name, model_id } = parseModelId(target);
-    const entry = this.providers.get(provider_name);
-    if (!entry) {
-      return Response.json(
-        { error: { message: `Provider "${provider_name}" not found`, type: 'invalid_request_error' } },
-        { status: 400 }
-      );
+    const resolved = this.resolveProvider(target);
+    if ('error' in resolved) return resolved.error;
+
+    const { entry, modelId } = resolved;
+    const providerName = entry.config.name;
+    const modifiedRequest = { ...request, model: modelId };
+
+    if (request.stream) {
+      return this.executeStreamingTarget(entry, modifiedRequest, target, providerName, requestId);
     }
 
-    if (!entry.breaker.canExecute()) {
-      return Response.json(
-        { error: { message: `Provider "${provider_name}" circuit open`, type: 'service_unavailable' } },
-        { status: 503 }
-      );
-    }
+    return this.executeNonStreaming(entry, modifiedRequest, target, providerName, requestId, { 'X-Auto-Target': target });
+  }
 
-    const modifiedRequest = { ...request, model: model_id };
+  /**
+   * Execute a streaming request for an auto-routing target.
+   * Probes the first chunk to validate upstream health before creating the stream.
+   */
+  private async executeStreamingTarget(
+    entry: ProviderEntry,
+    request: ChatCompletionRequest,
+    target: string,
+    providerName: string,
+    requestId: string,
+  ): Promise<Response> {
     const startTime = Date.now();
 
     try {
-      if (request.stream) {
-        // 先取第一个 chunk 验证上游健康；失败则返回错误状态码让 auto 路由层重试
-        const iterator = entry.adapter.sendStreaming(modifiedRequest);
-        try {
-          const firstResult = await iterator.next();
-          if (firstResult.done) {
-            entry.breaker.recordFailure();
-            logRequestAsync(requestId, target, provider_name, Date.now() - startTime, 502, 'Empty stream');
-            return Response.json({ error: { message: 'Empty upstream stream', type: 'upstream_error' } }, { status: 502 });
-          }
-          const body = this.streamToReadableStream(entry, modifiedRequest, target, provider_name, requestId, iterator, firstResult.value);
-          return new Response(body, {
-            headers: {
-              'Content-Type': 'text/event-stream; charset=utf-8',
-              'Cache-Control': 'no-cache',
-              'X-Provider': provider_name,
-              'X-Auto-Target': target,
-            },
-          });
-        } catch (err) {
+      const iterator = entry.adapter.sendStreaming(request);
+      try {
+        const firstResult = await iterator.next();
+        if (firstResult.done) {
           entry.breaker.recordFailure();
-          const latency = Date.now() - startTime;
-          const errorMsg = err instanceof Error ? err.message : String(err);
-          const status = this.errorStatus(err);
-          logRequestAsync(requestId, target, provider_name, latency, status, errorMsg);
-          return Response.json({ error: { message: errorMsg, type: 'upstream_error' } }, { status });
+          logRequestAsync(requestId, target, providerName, Date.now() - startTime, 502, 'Empty stream');
+          return this.errorResponse('Empty upstream stream', 'upstream_error', 502);
         }
+        const body = this.streamToReadableStream(entry, request, target, providerName, requestId, iterator, firstResult.value);
+        return new Response(body, {
+          headers: {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-cache',
+            'X-Provider': providerName,
+            'X-Auto-Target': target,
+          },
+        });
+      } catch (err) {
+        // Streaming probe failed (e.g., connection error) — record and return error
+        entry.breaker.recordFailure();
+        const latency = Date.now() - startTime;
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        const status = this.errorStatus(err);
+        logRequestAsync(requestId, target, providerName, latency, status, errorMsg);
+        return this.errorResponse(errorMsg, 'upstream_error', status);
       }
-
-      const result = await entry.adapter.send(modifiedRequest);
-      entry.breaker.recordSuccess();
-      logRequestAsync(requestId, target, provider_name, Date.now() - startTime, 200);
-      return Response.json(result, { headers: { 'X-Provider': provider_name, 'X-Auto-Target': target } });
     } catch (err) {
+      // Outer catch for sendStreaming() itself failing
       entry.breaker.recordFailure();
       const latency = Date.now() - startTime;
       const errorMsg = err instanceof Error ? err.message : String(err);
       const status = this.errorStatus(err);
-      logRequestAsync(requestId, target, provider_name, latency, status, errorMsg);
-      return Response.json({ error: { message: errorMsg, type: 'upstream_error' } }, { status });
+      logRequestAsync(requestId, target, providerName, latency, status, errorMsg);
+      return this.errorResponse(errorMsg, 'upstream_error', status);
     }
   }
 
@@ -529,53 +587,3 @@ export class Router {
   }
 }
 
-// ---------------------------------------------------------------------------
-// 批量日志写入（模块级缓冲，减少 SQLite 写入频率）
-// ---------------------------------------------------------------------------
-
-interface PendingLog {
-  requestId: string;
-  model: string;
-  provider: string;
-  latency: number;
-  status: number;
-  error?: string;
-}
-
-const pendingLogs: PendingLog[] = [];
-
-function logRequestAsync(
-  requestId: string,
-  model: string,
-  provider: string,
-  latency: number,
-  status: number,
-  error?: string
-): void {
-  pendingLogs.push({ requestId, model, provider, latency, status, error });
-  if (pendingLogs.length >= 10) flushLogs();
-}
-
-function flushLogs(): void {
-  if (!pendingLogs.length) return;
-  const batch = pendingLogs.splice(0);
-  for (const log of batch) {
-    logRequest({
-      request_id: log.requestId,
-      model: log.model,
-      provider: log.provider,
-      latency_ms: log.latency,
-      status_code: log.status,
-      error_msg: log.error,
-    });
-  }
-}
-
-// 每 5 秒定时刷盘，防止尾部日志丢失
-const flushIntervalId = setInterval(flushLogs, 5_000);
-
-/** 停止批量日志刷盘定时器（用于优雅关闭） */
-export function stopFlushInterval(): void {
-  clearInterval(flushIntervalId);
-  flushLogs(); // 最后再刷一次，确保尾部日志不丢失
-}

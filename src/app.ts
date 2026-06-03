@@ -3,6 +3,7 @@ import { Router } from './router/index.js';
 import { getDb } from './db/index.js';
 import { type RequestLogger } from './middleware/request-logger.js';
 import { entryConverters } from './providers/index.js';
+import type { ChatCompletionResponse } from './types/api.js';
 
 export function createApp(router: Router, requestLogger?: RequestLogger) {
   const app = express();
@@ -44,6 +45,22 @@ export function createApp(router: Router, requestLogger?: RequestLogger) {
     pump();
   }
 
+  // 构造上游错误 → 原生错误响应实体（避免客户端收到非预期的 JSON 结构）
+  function buildUpstreamError(
+    requestId: string,
+    model: string,
+    errorMessage: string,
+  ): ChatCompletionResponse {
+    return {
+      id: requestId,
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [{ index: 0, message: { role: 'assistant', content: errorMessage }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    };
+  }
+
   async function handleEntry(
     protocol: string,
     req: Request,
@@ -79,12 +96,10 @@ export function createApp(router: Router, requestLogger?: RequestLogger) {
         if (!contentType.startsWith('text/event-stream')) {
           const data = await upstreamResponse.json();
           if (data.error) {
-            const nativeErr = converter.fromInternal({
-              id: requestId, object: 'chat.completion', created: Math.floor(Date.now() / 1000),
-              model: ccRequest.model,
-              choices: [{ index: 0, message: { role: 'assistant', content: data.error.message }, finish_reason: 'stop' }],
-              usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-            }, ccRequest.model);
+            const nativeErr = converter.fromInternal(
+              buildUpstreamError(requestId, ccRequest.model, data.error.message),
+              ccRequest.model,
+            );
             res.status(upstreamResponse.status).set('X-Request-Id', requestId).json(nativeErr);
           } else {
             res.status(upstreamResponse.status).set('X-Request-Id', requestId).json(data);
@@ -98,16 +113,11 @@ export function createApp(router: Router, requestLogger?: RequestLogger) {
 
       // 4. 非流式：ChatCompletionResponse → 原生格式
       const ccResp = await upstreamResponse.json();
-      // 上游返回错误 — 转换为原生格式，避免客户端收到非预期的 JSON 结构
       if (ccResp.error) {
-        const nativeErr = converter.fromInternal({
-          id: requestId,
-          object: 'chat.completion',
-          created: Math.floor(Date.now() / 1000),
-          model: ccRequest.model,
-          choices: [{ index: 0, message: { role: 'assistant', content: ccResp.error.message }, finish_reason: 'stop' }],
-          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-        }, ccRequest.model);
+        const nativeErr = converter.fromInternal(
+          buildUpstreamError(requestId, ccRequest.model, ccResp.error.message),
+          ccRequest.model,
+        );
         res.status(upstreamResponse.status).set('X-Request-Id', requestId).json(nativeErr);
         return;
       }

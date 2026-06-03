@@ -2,7 +2,8 @@ import 'dotenv/config';
 import { createApp } from './app.js';
 import { loadConfig } from './config/index.js';
 import { initDatabase, closeDatabase } from './db/index.js';
-import { Router, stopFlushInterval } from './router/index.js';
+import { Router } from './router/index.js';
+import { stopLogBuffer } from './db/index.js';
 import { RequestLogger } from './middleware/request-logger.js';
 
 async function main() {
@@ -44,7 +45,7 @@ async function main() {
   // 优雅关闭
   const cleanup = () => {
     requestLogger.close();
-    stopFlushInterval();
+    stopLogBuffer();
     router.destroy();
     closeDatabase();
   };
