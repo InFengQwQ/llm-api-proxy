@@ -28,7 +28,7 @@ export class MultiProtocolAdapter implements ProviderAdapter {
   private modelCache = new Map<string, ProviderAdapter>();
 
   constructor(
-    private config: ProviderConfig,
+    config: ProviderConfig,
     typeNames: string[],
   ) {
     this.name = config.name;
@@ -131,7 +131,7 @@ export class MultiProtocolAdapter implements ProviderAdapter {
       }
     }
 
-    throw lastError ?? new Error(`[multi] No adapter succeeded for model "${model}"`);
+    throw lastError;
   }
 
   async send(request: UnifiedRequest): Promise<UnifiedResponse> {
@@ -189,7 +189,7 @@ export class MultiProtocolAdapter implements ProviderAdapter {
       }
     }
 
-    throw lastError ?? new Error(`[multi] No streaming adapter succeeded for model "${model}"`);
+    throw lastError;
   }
 
   async health(): Promise<ProviderHealth> {

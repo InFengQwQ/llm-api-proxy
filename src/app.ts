@@ -205,7 +205,7 @@ export function createApp(router: Router, requestContextMiddleware?: RequestCont
   });
 
   // 全局错误处理
-  app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
     console.error('[Error]', err);
     const ctx = (res.locals as Record<string, unknown>).ctx as RequestContext | undefined;
     if (ctx) {

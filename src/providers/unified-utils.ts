@@ -5,8 +5,6 @@
 import type {
   UnifiedMessage,
   UnifiedContentBlock,
-  UnifiedRequest,
-  UnifiedResponse,
   UnifiedStreamEvent,
   ToolCall,
   ChatMessage,
@@ -34,50 +32,6 @@ export async function* parseUnifiedSSE(
       yield JSON.parse(data) as UnifiedStreamEvent;
     } catch { /* skip malformed chunks */ }
   }
-}
-
-// ═══════════════════════════════════════════════
-// Content block 收集器（流式使用）
-// ═══════════════════════════════════════════════
-
-export interface AccumulatorState {
-  text: string;
-  thinking: string;
-  toolUses: Map<number, { id: string; name: string; args: string }>;
-}
-
-export function createAccumulator(): AccumulatorState {
-  return { text: '', thinking: '', toolUses: new Map() };
-}
-
-export function applyEvent(state: AccumulatorState, event: UnifiedStreamEvent): void {
-  switch (event.type) {
-    case 'text_delta':
-      state.text += event.text;
-      break;
-    case 'thinking_delta':
-      state.thinking += event.thinking;
-      break;
-    case 'tool_use_start':
-      state.toolUses.set(event.index, { id: event.id, name: event.name, args: '' });
-      break;
-    case 'tool_use_delta':
-      const tu = state.toolUses.get(event.index);
-      if (tu) tu.args += event.partial_json;
-      break;
-  }
-}
-
-export function accumulatorToContent(state: AccumulatorState): UnifiedContentBlock[] {
-  const blocks: UnifiedContentBlock[] = [];
-  if (state.text) blocks.push({ type: 'text', text: state.text });
-  if (state.thinking) blocks.push({ type: 'thinking', thinking: state.thinking });
-  for (const [, tu] of state.toolUses) {
-    let input: Record<string, unknown> = {};
-    try { input = JSON.parse(tu.args || '{}'); } catch { /* ignore */ }
-    blocks.push({ type: 'tool_use', id: tu.id, name: tu.name, input });
-  }
-  return blocks;
 }
 
 // ═══════════════════════════════════════════════

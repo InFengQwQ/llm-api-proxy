@@ -5,57 +5,34 @@ server:
 
 providers:
   - name: "OpenRouter"
-    type: openai
+    type: auto
     api_key: "${OPENROUTER_API_KEY}"
     base_url: "https://openrouter.ai/api"
+    enabled: true
+    fetch_models: true
+    compat_output_tokens: false
     circuit_breaker:
       failure_threshold: 3
       recovery_timeout: 30
-
-  # - name: "Groq"
-  #   type: openai
-  #   api_key: "${GROQ_API_KEY}"
-  #   base_url: "https://api.groq.com/openai"
-  #   circuit_breaker:
-  #     failure_threshold: 3
-  #     recovery_timeout: 30
 
   - name: "NVIDIA"
-    type: openai
+    type: auto
     api_key: "${NVIDIA_API_KEY}"
     base_url: "https://integrate.api.nvidia.com"
+    enabled: true
+    fetch_models: true
+    compat_output_tokens: false
     circuit_breaker:
       failure_threshold: 3
       recovery_timeout: 30
 
-  # - name: "GitHubModels"
-  #   type: openai
-  #   api_key: "${GITHUB_API_KEY}"
-  #   base_url: "https://models.github.ai/inference"
-  #   circuit_breaker:
-  #     failure_threshold: 3
-  #     recovery_timeout: 30
-
-  # - name: "Cloudflare"
-  #   type: openai
-  #   api_key: "${CLOUDFLARE_API_KEY}"
-  #   base_url: "https://api.cloudflare.com/client/v4/accounts/f127d03f04d6fb3aea6e30e6bccd7507/ai"
-  #   circuit_breaker:
-  #     failure_threshold: 3
-  #     recovery_timeout: 30
-
-  # - name: "SiliconFlow"
-  #   type: openai
-  #   api_key: "${SILICONFLOW_API_KEY}"
-  #   base_url: "https://api.siliconflow.com"
-  #   circuit_breaker:
-  #     failure_threshold: 3
-  #     recovery_timeout: 30
-
-  - name: "LLM7"
-    type: openai
-    api_key: "${LLM7_API_KEY}"
-    base_url: "https://api.llm7.io"
+  - name: "SiliconFlow"
+    type: auto
+    api_key: "${SILICONFLOW_API_KEY}"
+    base_url: "https://api.siliconflow.com"
+    enabled: true
+    fetch_models: true
+    compat_output_tokens: false
     circuit_breaker:
       failure_threshold: 3
       recovery_timeout: 30
@@ -64,6 +41,9 @@ providers:
     type: [openai, anthropic, google, openai_responses]
     api_key: "${OPENCODE_API_KEY}"
     base_url: "https://opencode.ai/zen"
+    enabled: true
+    fetch_models: true
+    compat_output_tokens: false
     circuit_breaker:
       failure_threshold: 3
       recovery_timeout: 30
@@ -104,6 +84,7 @@ auto_routing:
       - OpenCode/nemotron-3-super-free
       - OpenCode/mimo-v2.5-free
       - OpenCode/big-pickle
+    failure_threshold: 1
   - name: T1-free
     targets:
       - OpenRouter/deepseek/deepseek-v4-flash:free

@@ -1,5 +1,5 @@
 import { appendFileSync, mkdirSync, readFileSync, statSync } from 'fs';
-import { join, dirname } from 'path';
+import { join } from 'path';
 import type { RequestContext } from '../types/log.js';
 
 // ── Log file path ───────────────────────────────────────────────────────

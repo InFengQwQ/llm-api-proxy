@@ -119,8 +119,6 @@ export class Router {
     for (const [name] of this.providers) {
       this.fetchProviderModels(name).then(models => {
         console.log(`[router] ${name}: ${models.length} models fetched`);
-      }).catch(() => {
-        // fetchProviderModels 内部已处理错误
       });
     }
   }
@@ -212,13 +210,14 @@ export class Router {
   private selectSubModel(
     targets: string[],
     group: string,
-    sessionId: string | null
+    sessionId: string | null,
+    tried: Set<string>,
   ): string | null {
     // 1. 会话粘性：同 session 尽量复用上次模型（保证上下文连贯）
     const sessionKey = `${group}:${sessionId ?? ''}`;
     if (sessionId) {
       const session = this.sessionMap.get(sessionKey);
-      if (session && targets.includes(session.target)) {
+      if (session && targets.includes(session.target) && !tried.has(session.target)) {
         const entry = this.getEntryByFullModel(session.target);
         if (entry && entry.breaker.canExecute() && !this.isModelOverheated(session.target)) {
           return session.target;
@@ -228,6 +227,7 @@ export class Router {
 
     // 2. 尝试所有候选，找第一个熔断闭合且不热的
     for (const target of targets) {
+      if (tried.has(target)) continue;
       const entry = this.getEntryByFullModel(target);
       if (!entry) continue;
       if (!entry.breaker.canExecute()) continue;
@@ -237,6 +237,7 @@ export class Router {
 
     // 3. 兜底：返回第一个熔断器在 half_open 的（允许探测）
     for (const target of targets) {
+      if (tried.has(target)) continue;
       const entry = this.getEntryByFullModel(target);
       if (entry && entry.breaker.getState() === 'half_open') return target;
     }
@@ -246,7 +247,7 @@ export class Router {
 
   private getEntryByFullModel(fullModel: string): ProviderEntry | null {
     try {
-      const { provider_name, model_id } = parseModelId(fullModel);
+      const { provider_name } = parseModelId(fullModel);
       // 只校验 provider 存在，model_id 不在这里检查
       return this.providers.get(provider_name) ?? null;
     } catch {
@@ -355,8 +356,8 @@ export class Router {
 
     // 重试循环：每个 target 最多试一次，遇到 429 标记过热后切下一个
     while (tried.size < targets.length) {
-      const target = this.selectSubModel(targets, group, sessionId ?? null);
-      if (!target || tried.has(target)) break;
+      const target = this.selectSubModel(targets, group, sessionId ?? null, tried);
+      if (!target) break;
       tried.add(target);
 
       if (sessionId) this.bindSession(group, sessionId, target);
@@ -425,9 +426,8 @@ export class Router {
     providerName: string,
     ctx: RequestContext,
   ): Promise<Response> {
+    const iterator = entry.adapter.sendStreaming(request);
     try {
-      const iterator = entry.adapter.sendStreaming(request);
-      try {
         const firstResult = await iterator.next();
         if (firstResult.done) {
           entry.breaker.recordFailure();
@@ -463,19 +463,6 @@ export class Router {
         logComplete(ctx);
         return this.errorResponse(ctx.errorMsg, 'upstream_error', ctx.statusCode);
       }
-    } catch (err) {
-      // Outer catch for sendStreaming() itself failing
-      entry.breaker.recordFailure();
-      ctx.provider = providerName;
-      ctx.statusCode = this.errorStatus(err);
-      ctx.latencyMs = Date.now() - ctx.startTime;
-      ctx.errorMsg = err instanceof Error ? err.message : String(err);
-      if (err instanceof ProviderApiError && err.payload) {
-        ctx.errorPayload = err.payload;
-      }
-      logComplete(ctx);
-      return this.errorResponse(ctx.errorMsg, 'upstream_error', ctx.statusCode);
-    }
   }
 
   private streamToReadableStream(

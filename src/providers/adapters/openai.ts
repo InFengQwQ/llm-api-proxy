@@ -51,7 +51,8 @@ export class OpenAIAdapter implements ProviderAdapter {
       // OpenAI-compatible APIs (e.g. NVIDIA) require `name` on tool-role messages
       if (m.role === 'tool') cleaned.name = m.name ?? '';
       else if (m.name) cleaned.name = m.name;
-      if (m.tool_call_id) cleaned.tool_call_id = m.tool_call_id;
+      if (m.role === 'tool') cleaned.tool_call_id = m.tool_call_id ?? '';
+      else if (m.tool_call_id) cleaned.tool_call_id = m.tool_call_id;
       if (m.tool_calls !== undefined) cleaned.tool_calls = m.tool_calls;
       return cleaned;
     });
@@ -257,7 +258,7 @@ export function createOpenAIEntryConverter(): EntryConverter {
       };
     },
 
-    toError(status: number, message: string, type?: string): unknown {
+    toError(_status: number, message: string, type?: string): unknown {
       return { error: { message, type: type ?? 'upstream_error', param: null, code: null } };
     },
 

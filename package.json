@@ -1,6 +1,7 @@
 {
   "name": "llm-api-proxy",
   "version": "1.0.0",
+  "private": true,
   "description": "统一 LLM API 代理网关，支持多 Provider 自动路由与故障切换",
   "type": "module",
   "scripts": {

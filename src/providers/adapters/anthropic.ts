@@ -16,7 +16,7 @@ import {
   throwOnHttpError,
   readSSELines,
 } from '../base.js';
-import { createAccumulator, parseUnifiedSSE } from '../unified-utils.js';
+import { parseUnifiedSSE } from '../unified-utils.js';
 
 export class AnthropicAdapter implements ProviderAdapter {
   name: string;
@@ -273,10 +273,6 @@ function contentToUnifiedBlocks(blocks: AnthropicContentBlock[]): UnifiedContent
         return { type: 'text' as const, text: '' };
     }
   });
-}
-
-function safeParse(s: string): Record<string, unknown> {
-  try { return JSON.parse(s) as Record<string, unknown>; } catch { return {}; }
 }
 
 export function createAnthropicEntryConverter(): EntryConverter {

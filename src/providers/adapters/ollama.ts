@@ -125,10 +125,8 @@ export class OllamaAdapter implements ProviderAdapter {
         }
 
         const toolCalls = msg?.tool_calls as Array<{ id: string; function: { name: string; arguments: string } }> | undefined;
-        let hasToolCall = false;
         if (toolCalls?.length) {
           if (!started) { yield { type: 'message_start', id: msgId, model: request.model }; started = true; }
-          hasToolCall = true;
           for (const tc of toolCalls) {
             yield { type: 'tool_use_start', id: tc.id, name: tc.function.name, index: 0 };
             yield { type: 'tool_use_delta', id: tc.id, partial_json: tc.function.arguments, index: 0 };
