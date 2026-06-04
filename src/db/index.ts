@@ -1,98 +1,22 @@
-import Database from 'better-sqlite3';
-import { mkdirSync } from 'fs';
-import { dirname } from 'path';
+import { appendFileSync, mkdirSync, readFileSync, statSync } from 'fs';
+import { join, dirname } from 'path';
 import type { RequestContext } from '../types/log.js';
 
-let db: Database.Database | null = null;
+// ── Log file path ───────────────────────────────────────────────────────
 
-// ── Schema ──────────────────────────────────────────────────────────────
+const DEFAULT_LOG_DIR = 'logs';
+const DEFAULT_LOG_FILE = 'requests.ndjson';
 
-const CREATE_TABLE_SQL = `
-  CREATE TABLE IF NOT EXISTS request_logs (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    request_id        TEXT NOT NULL,
-    method            TEXT NOT NULL DEFAULT 'POST',
-    path              TEXT NOT NULL DEFAULT '',
-    model             TEXT NOT NULL,
-    provider          TEXT NOT NULL,
-    entry_protocol    TEXT NOT NULL DEFAULT '',
-    is_stream         INTEGER NOT NULL DEFAULT 0,
-    status_code       INTEGER NOT NULL,
-    latency_ms        INTEGER NOT NULL,
-    ip                TEXT NOT NULL DEFAULT '',
-    user_agent        TEXT NOT NULL DEFAULT '',
-    prompt_tokens     INTEGER,
-    completion_tokens INTEGER,
-    total_tokens      INTEGER,
-    error_msg         TEXT,
-    created_at        DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-`;
+let logDir: string = DEFAULT_LOG_DIR;
+let logFilePath: string = join(DEFAULT_LOG_DIR, DEFAULT_LOG_FILE);
 
-const CREATE_INDEXES_SQL = [
-  'CREATE INDEX IF NOT EXISTS idx_logs_model ON request_logs(model)',
-  'CREATE INDEX IF NOT EXISTS idx_logs_provider ON request_logs(provider)',
-  'CREATE INDEX IF NOT EXISTS idx_logs_created ON request_logs(created_at)',
-  'CREATE INDEX IF NOT EXISTS idx_logs_status ON request_logs(status_code)',
-  'CREATE INDEX IF NOT EXISTS idx_logs_entry_protocol ON request_logs(entry_protocol)',
-];
-
-/** 增量迁移：为已有数据库添加新列 */
-const MIGRATIONS: Array<{ column: string; sql: string }> = [
-  { column: 'method', sql: "ALTER TABLE request_logs ADD COLUMN method TEXT NOT NULL DEFAULT 'POST'" },
-  { column: 'path', sql: "ALTER TABLE request_logs ADD COLUMN path TEXT NOT NULL DEFAULT ''" },
-  { column: 'entry_protocol', sql: "ALTER TABLE request_logs ADD COLUMN entry_protocol TEXT NOT NULL DEFAULT ''" },
-  { column: 'is_stream', sql: "ALTER TABLE request_logs ADD COLUMN is_stream INTEGER NOT NULL DEFAULT 0" },
-  { column: 'ip', sql: "ALTER TABLE request_logs ADD COLUMN ip TEXT NOT NULL DEFAULT ''" },
-  { column: 'user_agent', sql: "ALTER TABLE request_logs ADD COLUMN user_agent TEXT NOT NULL DEFAULT ''" },
-];
-
-const PURGE_RETENTION_DAYS = 30;
-
-/** 真正执行 new Database + 迁移 + 索引 */
-function buildDatabase(dbPath: string): Database.Database {
-  const conn = new Database(dbPath);
-  conn.exec('PRAGMA journal_mode=DELETE');
-  conn.exec('PRAGMA synchronous=NORMAL');
-  conn.exec(CREATE_TABLE_SQL);
-
-  // 增量迁移：必须在建索引之前（索引引用新列）
-  const existingColumns = new Set(
-    (conn.prepare("PRAGMA table_info(request_logs)").all() as Array<{ name: string }>)
-      .map(col => col.name),
-  );
-  for (const migration of MIGRATIONS) {
-    if (!existingColumns.has(migration.column)) {
-      conn.exec(migration.sql);
-    }
-  }
-
-  for (const sql of CREATE_INDEXES_SQL) {
-    conn.exec(sql);
-  }
-  return conn;
+export function initLogger(dir?: string, file?: string): void {
+  logDir = dir ?? DEFAULT_LOG_DIR;
+  logFilePath = join(logDir, file ?? DEFAULT_LOG_FILE);
+  mkdirSync(logDir, { recursive: true });
 }
 
-export function initDatabase(path: string): Database.Database {
-  if (db) return db;
-  mkdirSync(dirname(path), { recursive: true });
-  db = buildDatabase(path);
-  return db;
-}
-
-export function getDb(): Database.Database {
-  if (!db) throw new Error('Database not initialized. Call initDatabase first.');
-  return db;
-}
-
-export function closeDatabase(): void {
-  if (db) {
-    db.close();
-    db = null;
-  }
-}
-
-// ── 日志写入 ───────────────────────────────────────────────────────────
+// ── 日志写入类型 ─────────────────────────────────────────────────────────
 
 interface FullLogParams {
   request_id: string;
@@ -113,33 +37,14 @@ interface FullLogParams {
 }
 
 function logRequest(params: FullLogParams): void {
-  const stmt = getDb().prepare(`
-    INSERT INTO request_logs (
-      request_id, method, path, model, provider, entry_protocol, is_stream,
-      status_code, latency_ms, ip, user_agent,
-      prompt_tokens, completion_tokens, total_tokens, error_msg
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  stmt.run(
-    params.request_id,
-    params.method,
-    params.path,
-    params.model,
-    params.provider,
-    params.entry_protocol,
-    params.is_stream,
-    params.status_code,
-    params.latency_ms,
-    params.ip,
-    params.user_agent,
-    params.prompt_tokens,
-    params.completion_tokens,
-    params.total_tokens,
-    params.error_msg,
-  );
+  const record = {
+    ...params,
+    created_at: new Date().toISOString(),
+  };
+  appendFileSync(logFilePath, JSON.stringify(record) + '\n', 'utf-8');
 }
 
-// ── 批量日志缓冲 ───────────────────────────────────────────────────────
+// ── 批量日志缓冲 ─────────────────────────────────────────────────────────
 
 type PendingLog = FullLogParams;
 
@@ -183,28 +88,12 @@ export function logComplete(ctx: RequestContext): void {
 }
 
 let flushIntervalId: ReturnType<typeof setInterval> | null = null;
-let lastPurgeTime = 0;
-const PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
-
-function maybePurgeOldLogs(): void {
-  const now = Date.now();
-  if (now - lastPurgeTime < PURGE_INTERVAL_MS) return;
-  lastPurgeTime = now;
-  try {
-    getDb().prepare(
-      `DELETE FROM request_logs WHERE created_at < datetime('now', '-${PURGE_RETENTION_DAYS} days')`,
-    ).run();
-  } catch {
-    // 日志轮转失败不应影响主流程
-  }
-}
 
 /** 启动日志缓冲定时器 */
 export function startLogBuffer(): void {
   if (flushIntervalId) return;
   flushIntervalId = setInterval(() => {
     flushLogs();
-    if (db) maybePurgeOldLogs();
   }, FLUSH_INTERVAL_MS);
 }
 
@@ -215,4 +104,52 @@ export function stopLogBuffer(): void {
     flushIntervalId = null;
   }
   flushLogs();
+}
+
+// ── 日志读取（用于 /admin/logs 端点） ────────────────────────────────────
+
+export interface LogQuery {
+  limit: number;
+  provider?: string;
+  protocol?: string;
+  status?: string;
+  method?: string;
+}
+
+export function readLogs(query: LogQuery): unknown[] {
+  // 日志文件不存在时返回空数组
+  try {
+    if (!statSync(logFilePath).isFile()) return [];
+  } catch {
+    return [];
+  }
+
+  const raw = readFileSync(logFilePath, 'utf-8');
+  const lines = raw.trim().split('\n');
+  const results: Array<Record<string, unknown>> = [];
+
+  for (const line of lines) {
+    if (!line) continue;
+    try {
+      const entry = JSON.parse(line) as Record<string, unknown>;
+      // 过滤
+      if (query.provider && entry.provider !== query.provider) continue;
+      if (query.protocol && entry.entry_protocol !== query.protocol) continue;
+      if (query.status && String(entry.status_code) !== query.status) continue;
+      if (query.method && entry.method !== query.method) continue;
+      results.push(entry);
+    } catch {
+      // 跳过损坏的行
+      continue;
+    }
+  }
+
+  // 按 created_at 降序排列
+  results.sort((a, b) => {
+    const ta = String(a.created_at ?? '');
+    const tb = String(b.created_at ?? '');
+    return tb.localeCompare(ta);
+  });
+
+  return results.slice(0, query.limit);
 }

@@ -1,7 +1,6 @@
 import express, { type Request, type Response, type NextFunction } from 'express';
 import { Router } from './router/index.js';
-import { getDb } from './db/index.js';
-import { logComplete } from './db/index.js';
+import { logComplete, readLogs } from './db/index.js';
 import { RequestContextMiddleware } from './middleware/request-context.js';
 import type { RequestContext } from './types/log.js';
 import { entryConverters } from './providers/index.js';
@@ -193,7 +192,7 @@ export function createApp(router: Router, requestContextMiddleware?: RequestCont
     res.json(router.getModelHeatInfo());
   });
 
-  // 请求日志
+  // 请求日志（从 NDJSON 文件读取）
   app.get('/admin/logs', (req, res) => {
     const limit = Math.min(Number(req.query.limit) || 100, 1000);
     const provider = req.query.provider as string | undefined;
@@ -201,35 +200,8 @@ export function createApp(router: Router, requestContextMiddleware?: RequestCont
     const status = req.query.status as string | undefined;
     const method = req.query.method as string | undefined;
 
-    const conditions: string[] = [];
-    const params: unknown[] = [];
-
-    if (provider) {
-      conditions.push('provider = ?');
-      params.push(provider);
-    }
-    if (protocol) {
-      conditions.push('entry_protocol = ?');
-      params.push(protocol);
-    }
-    if (status) {
-      conditions.push('status_code = ?');
-      params.push(Number(status));
-    }
-    if (method) {
-      conditions.push('method = ?');
-      params.push(method);
-    }
-
-    let sql = 'SELECT * FROM request_logs';
-    if (conditions.length > 0) {
-      sql += ' WHERE ' + conditions.join(' AND ');
-    }
-    sql += ' ORDER BY created_at DESC LIMIT ?';
-    params.push(limit);
-
-    const rows = getDb().prepare(sql).all(...params);
-    res.json({ logs: rows });
+    const logs = readLogs({ limit, provider, protocol, status, method });
+    res.json({ logs });
   });
 
   // 全局错误处理

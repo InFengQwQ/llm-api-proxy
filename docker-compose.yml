@@ -6,7 +6,7 @@ services:
     ports:
       - "${PORT}:${PORT}"
     volumes:
-      - llm-data:/app/data
+      - llm-data:/app/logs
       - ./config.yaml:/app/config.yaml:ro
     restart: unless-stopped
     healthcheck:

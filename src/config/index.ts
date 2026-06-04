@@ -78,11 +78,9 @@ const ConfigSchema = z.object({
     master_key: z.string().optional(),
   }).strict(),
   providers: z.array(ProviderSchema).min(1),
-  database: z.object({
-    path: z.string().default('./data/gateway.db'),
-  }).strict(),
   logging: z.object({
     log_dir: z.string().default('logs'),
+    log_file: z.string().default('requests.ndjson'),
   }).strict().optional().default({}),
   rate_limits: RateLimitSchema.optional(),
   /** auto 路由组，调用方使用 model="auto:<group>" 触发 */

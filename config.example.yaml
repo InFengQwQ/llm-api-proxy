@@ -68,8 +68,9 @@ providers:
       failure_threshold: 3
       recovery_timeout: 30
 
-database:
-  path: "./data/gateway.db"
+logging:
+  log_dir: "logs"
+  log_file: "requests.ndjson"
 
 rate_limits:
   rpm: 60

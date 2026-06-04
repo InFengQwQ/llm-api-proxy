@@ -1,19 +1,19 @@
 import 'dotenv/config';
 import { createApp } from './app.js';
 import { loadConfig } from './config/index.js';
-import { initDatabase, closeDatabase, startLogBuffer, stopLogBuffer } from './db/index.js';
+import { initLogger, startLogBuffer, stopLogBuffer } from './db/index.js';
 import { Router } from './router/index.js';
 import { RequestContextMiddleware } from './middleware/request-context.js';
 
 async function main() {
   const config = loadConfig();
 
-  // 初始化数据库 + 启动日志缓冲
-  initDatabase(config.database.path);
+  // 初始化日志目录 + 启动日志缓冲
+  initLogger(config.logging.log_dir, config.logging.log_file);
   startLogBuffer();
 
   // 初始化请求上下文中间件（body dump 文件写入）
-  const requestContextMiddleware = new RequestContextMiddleware(config.logging?.log_dir ?? 'logs');
+  const requestContextMiddleware = new RequestContextMiddleware(config.logging.log_dir);
 
   // 初始化路由
   const router = new Router();
@@ -46,7 +46,6 @@ async function main() {
   const cleanup = () => {
     stopLogBuffer();
     router.destroy();
-    closeDatabase();
   };
   process.on('SIGINT', () => {
     console.log('\n   Shutting down...');
