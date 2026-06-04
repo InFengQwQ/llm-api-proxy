@@ -4,18 +4,21 @@ import type {
   UnifiedStreamEvent,
   ProviderHealth,
 } from '../../types/api.js';
-import { ProviderApiError as ProviderApiErrorClass } from '../../types/api.js';
+import { ProviderApiError } from '../../types/api.js';
 import type { ProviderConfig } from '../../config/index.js';
 import type { ProviderAdapter, EntryConverter } from '../base.js';
 import {
   createHealthCheck,
   fetchModelsOpenAIFormat,
+  throwOnHttpError,
+  readSSELines,
 } from '../base.js';
 import {
   chatMessagesToUnified,
   unifiedToChatMessages,
   blocksToText,
   blocksToToolCalls,
+  blocksToThinking,
   parseUnifiedSSE,
 } from '../unified-utils.js';
 
@@ -38,14 +41,16 @@ export class OpenAIAdapter implements ProviderAdapter {
     };
   }
 
-  private buildRequestBody(request: UnifiedRequest, stream: boolean): Record<string, unknown> {
+  private buildRequest(request: UnifiedRequest, stream: boolean): Record<string, unknown> {
     const chatMsgs = unifiedToChatMessages(request.messages);
     const cleanMessages = chatMsgs.map(m => {
       const cleaned: Record<string, unknown> = {
         role: m.role,
         content: m.content ?? '',
       };
-      if (m.name) cleaned.name = m.name;
+      // OpenAI-compatible APIs (e.g. NVIDIA) require `name` on tool-role messages
+      if (m.role === 'tool') cleaned.name = m.name ?? '';
+      else if (m.name) cleaned.name = m.name;
       if (m.tool_call_id) cleaned.tool_call_id = m.tool_call_id;
       if (m.tool_calls !== undefined) cleaned.tool_calls = m.tool_calls;
       return cleaned;
@@ -76,7 +81,7 @@ export class OpenAIAdapter implements ProviderAdapter {
     return body;
   }
 
-  private toUnifiedResponse(data: Record<string, unknown>, requestModel: string): UnifiedResponse {
+  private parseResponse(data: Record<string, unknown>, requestModel: string): UnifiedResponse {
     const choices = (data.choices ?? []) as Array<{
       message?: { role?: string; content?: string | null; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> };
       finish_reason?: string;
@@ -100,7 +105,9 @@ export class OpenAIAdapter implements ProviderAdapter {
       id: (data.id as string) ?? `openai-${Date.now()}`,
       model: requestModel,
       content,
-      stop_reason: choice?.finish_reason === 'tool_calls' ? 'tool_use' : 'stop',
+      stop_reason: choice?.finish_reason === 'tool_calls' ? 'tool_use'
+        : choice?.finish_reason === 'length' ? 'max_tokens'
+        : 'stop',
       usage: {
         input_tokens: usage.prompt_tokens ?? 0,
         output_tokens: usage.completion_tokens ?? 0,
@@ -109,7 +116,7 @@ export class OpenAIAdapter implements ProviderAdapter {
   }
 
   async send(request: UnifiedRequest): Promise<UnifiedResponse> {
-    const body = this.buildRequestBody(request, false);
+    const body = this.buildRequest(request, false);
 
     const response = await fetch(`${this.getBaseUrl()}/v1/chat/completions`, {
       method: 'POST',
@@ -117,18 +124,13 @@ export class OpenAIAdapter implements ProviderAdapter {
       body: JSON.stringify(body),
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      let payload;
-      try { payload = JSON.parse(errorText); } catch { /* ignore */ }
-      throw new ProviderApiErrorClass(`OpenAI API error ${response.status}: ${errorText}`, response.status, payload);
-    }
+    await throwOnHttpError(response, this.name);
 
-    return this.toUnifiedResponse(await response.json() as Record<string, unknown>, request.model);
+    return this.parseResponse(await response.json() as Record<string, unknown>, request.model);
   }
 
   async *sendStreaming(request: UnifiedRequest): AsyncGenerator<UnifiedStreamEvent> {
-    const body = this.buildRequestBody(request, true);
+    const body = this.buildRequest(request, true);
 
     const response = await fetch(`${this.getBaseUrl()}/v1/chat/completions`, {
       method: 'POST',
@@ -136,65 +138,52 @@ export class OpenAIAdapter implements ProviderAdapter {
       body: JSON.stringify(body),
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      let payload;
-      try { payload = JSON.parse(errorText); } catch { /* ignore */ }
-      throw new ProviderApiErrorClass(`OpenAI API error ${response.status}: ${errorText}`, response.status, payload);
-    }
+    await throwOnHttpError(response, this.name);
 
-    const reader = response.body?.getReader();
-    if (!reader) throw new Error('No response body');
-
-    const decoder = new TextDecoder();
-    let buffer = '';
     const msgId = `openai-${Date.now()}`;
     let started = false;
+    const activeToolIndices = new Set<number>();
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6).trim();
-        if (data === '[DONE]') {
-          yield { type: 'message_stop', stop_reason: 'stop' };
-          return;
+    for await (const line of readSSELines(response)) {
+      if (!line.startsWith('data: ')) continue;
+      const data = line.slice(6).trim();
+      if (data === '[DONE]') {
+        yield { type: 'message_stop', stop_reason: 'stop' };
+        return;
+      }
+      try {
+        const chunk = JSON.parse(data);
+        if (!started) {
+          yield { type: 'message_start', id: chunk.id ?? msgId, model: request.model };
+          started = true;
         }
-        try {
-          const chunk = JSON.parse(data);
-          if (!started) {
-            yield { type: 'message_start', id: chunk.id ?? msgId, model: request.model };
-            started = true;
-          }
-          const delta = chunk.choices?.[0]?.delta;
-          if (delta?.content) {
-            yield { type: 'text_delta', text: delta.content, index: 0 };
-          }
-          if (delta?.reasoning_content) {
-            yield { type: 'thinking_delta', thinking: delta.reasoning_content, index: 0 };
-          }
-          if (delta?.tool_calls) {
-            for (const tc of delta.tool_calls) {
-              if (tc.id) {
-                yield { type: 'tool_use_start', id: tc.id, name: tc.function?.name ?? '', index: tc.index };
-              }
-              if (tc.function?.arguments) {
-                yield { type: 'tool_use_delta', id: tc.id ?? '', partial_json: tc.function.arguments, index: tc.index };
-              }
+        const delta = chunk.choices?.[0]?.delta;
+        if (delta?.content) {
+          yield { type: 'text_delta', text: delta.content, index: 0 };
+        }
+        if (delta?.reasoning_content) {
+          yield { type: 'thinking_delta', thinking: delta.reasoning_content, index: 0 };
+        }
+        if (delta?.tool_calls) {
+          for (const tc of delta.tool_calls) {
+            if (tc.id) {
+              activeToolIndices.add(tc.index);
+              yield { type: 'tool_use_start', id: tc.id, name: tc.function?.name ?? '', index: tc.index };
+            }
+            if (tc.function?.arguments) {
+              yield { type: 'tool_use_delta', id: tc.id ?? '', partial_json: tc.function.arguments, index: tc.index };
             }
           }
-          if (chunk.choices?.[0]?.finish_reason) {
-            yield { type: 'message_stop', stop_reason: chunk.choices[0].finish_reason };
-          }
-        } catch (e) {
-          throw new ProviderApiErrorClass(`Failed to parse chunk: ${data}`, 500, { error: e });
         }
+        if (chunk.choices?.[0]?.finish_reason) {
+          for (const index of activeToolIndices) {
+            yield { type: 'content_block_stop', index };
+          }
+          activeToolIndices.clear();
+          yield { type: 'message_stop', stop_reason: chunk.choices[0].finish_reason };
+        }
+      } catch (e) {
+        throw new ProviderApiError(`Failed to parse chunk: ${data}`, 500, { error: e });
       }
     }
   }
@@ -244,6 +233,7 @@ export function createOpenAIEntryConverter(): EntryConverter {
     fromInternal(resp: UnifiedResponse): unknown {
       const texts = blocksToText(resp.content);
       const toolCalls = blocksToToolCalls(resp.content);
+      const reasoningContent = blocksToThinking(resp.content);
       return {
         id: resp.id,
         object: 'chat.completion',
@@ -254,9 +244,10 @@ export function createOpenAIEntryConverter(): EntryConverter {
           message: {
             role: 'assistant',
             content: texts || null,
+            ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
             ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
           },
-          finish_reason: resp.stop_reason === 'tool_use' ? 'tool_calls' : 'stop',
+          finish_reason: resp.stop_reason === 'tool_use' ? 'tool_calls' : resp.stop_reason === 'max_tokens' ? 'length' : 'stop',
         }],
         usage: {
           prompt_tokens: resp.usage.input_tokens,
@@ -264,6 +255,10 @@ export function createOpenAIEntryConverter(): EntryConverter {
           total_tokens: resp.usage.input_tokens + resp.usage.output_tokens,
         },
       };
+    },
+
+    toError(status: number, message: string, type?: string): unknown {
+      return { error: { message, type: type ?? 'upstream_error', param: null, code: null } };
     },
 
     transformStream(source: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
@@ -290,12 +285,12 @@ export function createOpenAIEntryConverter(): EntryConverter {
                   break;
                 case 'tool_use_start':
                   controller.enqueue(encoder.encode(
-                    `data: ${JSON.stringify({ id: msgId, object: 'chat.completion.chunk', created, model, choices: [{ index: event.index, delta: { tool_calls: [{ index: 0, id: event.id, type: 'function', function: { name: event.name, arguments: '' } }] } }] })}\n\n`
+                    `data: ${JSON.stringify({ id: msgId, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: event.index, id: event.id, type: 'function', function: { name: event.name, arguments: '' } }] } }] })}\n\n`
                   ));
                   break;
                 case 'tool_use_delta':
                   controller.enqueue(encoder.encode(
-                    `data: ${JSON.stringify({ id: msgId, object: 'chat.completion.chunk', created, model, choices: [{ index: event.index, delta: { tool_calls: [{ index: 0, function: { arguments: event.partial_json } }] } }] })}\n\n`
+                    `data: ${JSON.stringify({ id: msgId, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: event.index, function: { arguments: event.partial_json } }] } }] })}\n\n`
                   ));
                   break;
                 case 'message_stop': {

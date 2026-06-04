@@ -14,8 +14,8 @@
 
 ```bash
 cp config.example.yaml config.yaml    # 复制并填入 API Key
-npm install
-npm run dev                           # 开发模式（热重载）
+npm install                           # 安装主机端测试/lint 依赖
+npm run up                            # 构建镜像并启动容器
 ```
 
 ## API
@@ -144,16 +144,19 @@ auto_routing:
 ## Docker
 
 ```bash
-docker compose up --build        # 或 .\build.ps1
+npm run up         # 启动容器（源码变了自动 rebuild）
+build.ps1          # 强制 down → build → up（PowerShell，每次从零）
+npm run down       # 停止并移除容器
+npm run logs       # 跟随容器日志
 ```
 
-挂载：`./config.yaml`（只读）· `./data/` · `./logs/`
+挂载：`./config.yaml`（只读）· `llm-data`（named volume，持久化 SQLite）
 
 ## 开发
 
+改代码就 `npm run up`——容器内 `tsx` 直接跑 TypeScript，重建即生效，不需要本地 `node`。
+
 ```bash
-npm run dev       # tsx watch 热重载
-npm run build     # tsc 编译
-npm test          # vitest 单元测试
-npm run lint      # tsc --noEmit 类型检查
+npm test           # vitest 单元测试（主机跑）
+npm run lint       # tsc --noEmit 类型检查
 ```

@@ -2,9 +2,10 @@ import type { UnifiedRequest, UnifiedStreamEvent } from '../types/api.js';
 import { ProviderApiError } from '../types/api.js';
 import type { ProviderConfig, AutoRoutingConfig, AutoRoutingGroup } from '../config/index.js';
 import type { ProviderAdapter } from '../providers/base.js';
+import type { RequestContext } from '../types/log.js';
+import { logComplete } from '../db/index.js';
 import { createAdapter, parseModelId } from '../providers/index.js';
 import { CircuitBreaker } from './circuit-breaker.js';
-import { logRequestAsync } from '../db/index.js';
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -161,29 +162,40 @@ export class Router {
 
   /**
    * Execute a non-streaming request against a provider target.
-   * Returns a Response (success or error), records circuit breaker state and logs.
+   * Fills ctx and logs the result.
    */
   private async executeNonStreaming(
     entry: ProviderEntry,
     request: UnifiedRequest,
-    modelId: string,
     providerName: string,
-    requestId: string,
+    ctx: RequestContext,
     extraHeaders?: Record<string, string>,
   ): Promise<Response> {
-    const startTime = Date.now();
     try {
       const result = await entry.adapter.send(request);
       entry.breaker.recordSuccess();
-      logRequestAsync(requestId, modelId, providerName, Date.now() - startTime, 200);
+      ctx.provider = providerName;
+      ctx.statusCode = 200;
+      ctx.latencyMs = Date.now() - ctx.startTime;
+      if (result.usage) {
+        ctx.promptTokens = result.usage.input_tokens ?? null;
+        ctx.completionTokens = result.usage.output_tokens ?? null;
+        ctx.totalTokens = (ctx.promptTokens !== null && ctx.completionTokens !== null)
+          ? ctx.promptTokens + ctx.completionTokens : null;
+      }
+      logComplete(ctx);
       return Response.json(result, { headers: { 'X-Provider': providerName, ...extraHeaders } });
     } catch (err) {
       entry.breaker.recordFailure();
-      const latency = Date.now() - startTime;
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      const status = this.errorStatus(err);
-      logRequestAsync(requestId, modelId, providerName, latency, status, errorMsg);
-      return this.errorResponse(errorMsg, 'upstream_error', status);
+      ctx.provider = providerName;
+      ctx.statusCode = this.errorStatus(err);
+      ctx.latencyMs = Date.now() - ctx.startTime;
+      ctx.errorMsg = err instanceof Error ? err.message : String(err);
+      if (err instanceof ProviderApiError && err.payload) {
+        ctx.errorPayload = err.payload;
+      }
+      logComplete(ctx);
+      return this.errorResponse(ctx.errorMsg, 'upstream_error', ctx.statusCode);
     }
   }
 
@@ -282,25 +294,34 @@ export class Router {
   async route(
     fullModelId: string,
     request: UnifiedRequest,
-    requestId: string,
+    ctx: RequestContext,
     sessionId?: string
   ): Promise<Response> {
     // 检查 auto 路由
     const autoMeta = this.parseAutoModel(fullModelId);
     if (autoMeta) {
-      return this.routeAuto(autoMeta.group, request, requestId, autoMeta.sessionId ?? sessionId);
+      return this.routeAuto(autoMeta.group, request, ctx, autoMeta.sessionId ?? sessionId);
     }
 
     // 直接路由
     const resolved = this.resolveProvider(fullModelId);
-    if ('error' in resolved) return resolved.error;
+    if ('error' in resolved) {
+      const { provider_name } = parseModelId(fullModelId);
+      ctx.provider = provider_name;
+      ctx.statusCode = resolved.error.status;
+      ctx.latencyMs = Date.now() - ctx.startTime;
+      ctx.errorMsg = `Provider for "${fullModelId}" not available`;
+      logComplete(ctx);
+      return resolved.error;
+    }
 
     const { entry, modelId } = resolved;
     const providerName = entry.config.name;
     const modifiedRequest = { ...request, model: modelId };
 
     if (request.stream) {
-      const body = this.streamToReadableStream(entry, modifiedRequest, fullModelId, providerName, requestId);
+      ctx.provider = providerName;
+      const body = this.streamToReadableStream(entry, modifiedRequest, providerName, ctx);
       return new Response(body, {
         headers: {
           'Content-Type': 'text/event-stream; charset=utf-8',
@@ -310,22 +331,23 @@ export class Router {
       });
     }
 
-    return this.executeNonStreaming(entry, modifiedRequest, fullModelId, providerName, requestId);
+    return this.executeNonStreaming(entry, modifiedRequest, providerName, ctx);
   }
 
   private async routeAuto(
     group: string,
     request: UnifiedRequest,
-    requestId: string,
+    ctx: RequestContext,
     sessionId?: string
   ): Promise<Response> {
     const groupConfig = this.autoRoutingMap.get(group);
     if (!groupConfig) {
-      return this.errorResponse(
-        `Auto routing group "${group}" not found`,
-        'invalid_request_error',
-        400,
-      );
+      ctx.provider = '-';
+      ctx.statusCode = 400;
+      ctx.latencyMs = Date.now() - ctx.startTime;
+      ctx.errorMsg = `Auto routing group "${group}" not found`;
+      logComplete(ctx);
+      return this.errorResponse(ctx.errorMsg, 'invalid_request_error', 400);
     }
 
     const { targets } = groupConfig;
@@ -340,7 +362,7 @@ export class Router {
       if (sessionId) this.bindSession(group, sessionId, target);
 
       // 直接执行，不走递归 route()，以便在这里处理 429 重试
-      const response = await this.executeTarget(target, request, requestId);
+      const response = await this.executeTarget(target, request, ctx);
       const status = response.status;
 
       if (status === 200 || status === 400 || status === 401 || status === 403) {
@@ -357,30 +379,39 @@ export class Router {
       continue;
     }
 
-    return this.errorResponse(
-      `All models in auto group "${group}" are unavailable or rate-limited`,
-      'service_unavailable',
-      503,
-    );
+    ctx.provider = '-';
+    ctx.statusCode = 503;
+    ctx.latencyMs = Date.now() - ctx.startTime;
+    ctx.errorMsg = `All models in auto group "${group}" are unavailable or rate-limited`;
+    logComplete(ctx);
+    return this.errorResponse(ctx.errorMsg, 'service_unavailable', 503);
   }
 
   private async executeTarget(
     target: string,
     request: UnifiedRequest,
-    requestId: string
+    ctx: RequestContext,
   ): Promise<Response> {
     const resolved = this.resolveProvider(target);
-    if ('error' in resolved) return resolved.error;
+    if ('error' in resolved) {
+      const { provider_name } = parseModelId(target);
+      ctx.provider = provider_name;
+      ctx.statusCode = resolved.error.status;
+      ctx.latencyMs = Date.now() - ctx.startTime;
+      ctx.errorMsg = `Provider "${provider_name}" unavailable`;
+      logComplete(ctx);
+      return resolved.error;
+    }
 
     const { entry, modelId } = resolved;
     const providerName = entry.config.name;
     const modifiedRequest = { ...request, model: modelId };
 
     if (request.stream) {
-      return this.executeStreamingTarget(entry, modifiedRequest, target, providerName, requestId);
+      return this.executeStreamingTarget(entry, modifiedRequest, target, providerName, ctx);
     }
 
-    return this.executeNonStreaming(entry, modifiedRequest, target, providerName, requestId, { 'X-Auto-Target': target });
+    return this.executeNonStreaming(entry, modifiedRequest, providerName, ctx, { 'X-Auto-Target': target });
   }
 
   /**
@@ -392,20 +423,25 @@ export class Router {
     request: UnifiedRequest,
     target: string,
     providerName: string,
-    requestId: string,
+    ctx: RequestContext,
   ): Promise<Response> {
-    const startTime = Date.now();
-
     try {
       const iterator = entry.adapter.sendStreaming(request);
       try {
         const firstResult = await iterator.next();
         if (firstResult.done) {
           entry.breaker.recordFailure();
-          logRequestAsync(requestId, target, providerName, Date.now() - startTime, 502, 'Empty stream');
+          ctx.provider = providerName;
+          ctx.statusCode = 502;
+          ctx.latencyMs = Date.now() - ctx.startTime;
+          ctx.errorMsg = 'Empty upstream stream';
+          logComplete(ctx);
           return this.errorResponse('Empty upstream stream', 'upstream_error', 502);
         }
-        const body = this.streamToReadableStream(entry, request, target, providerName, requestId, iterator, firstResult.value);
+        ctx.provider = providerName;
+        const body = this.streamToReadableStream(
+          entry, request, providerName, ctx, iterator, firstResult.value,
+        );
         return new Response(body, {
           headers: {
             'Content-Type': 'text/event-stream; charset=utf-8',
@@ -415,31 +451,38 @@ export class Router {
           },
         });
       } catch (err) {
-        // Streaming probe failed (e.g., connection error) — record and return error
+        // Streaming probe failed (e.g., connection error)
         entry.breaker.recordFailure();
-        const latency = Date.now() - startTime;
-        const errorMsg = err instanceof Error ? err.message : String(err);
-        const status = this.errorStatus(err);
-        logRequestAsync(requestId, target, providerName, latency, status, errorMsg);
-        return this.errorResponse(errorMsg, 'upstream_error', status);
+        ctx.provider = providerName;
+        ctx.statusCode = this.errorStatus(err);
+        ctx.latencyMs = Date.now() - ctx.startTime;
+        ctx.errorMsg = err instanceof Error ? err.message : String(err);
+        if (err instanceof ProviderApiError && err.payload) {
+          ctx.errorPayload = err.payload;
+        }
+        logComplete(ctx);
+        return this.errorResponse(ctx.errorMsg, 'upstream_error', ctx.statusCode);
       }
     } catch (err) {
       // Outer catch for sendStreaming() itself failing
       entry.breaker.recordFailure();
-      const latency = Date.now() - startTime;
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      const status = this.errorStatus(err);
-      logRequestAsync(requestId, target, providerName, latency, status, errorMsg);
-      return this.errorResponse(errorMsg, 'upstream_error', status);
+      ctx.provider = providerName;
+      ctx.statusCode = this.errorStatus(err);
+      ctx.latencyMs = Date.now() - ctx.startTime;
+      ctx.errorMsg = err instanceof Error ? err.message : String(err);
+      if (err instanceof ProviderApiError && err.payload) {
+        ctx.errorPayload = err.payload;
+      }
+      logComplete(ctx);
+      return this.errorResponse(ctx.errorMsg, 'upstream_error', ctx.statusCode);
     }
   }
 
   private streamToReadableStream(
     entry: ProviderEntry,
     request: UnifiedRequest,
-    modelId: string,
     providerName: string,
-    requestId: string,
+    ctx: RequestContext,
     iterator?: AsyncGenerator<UnifiedStreamEvent>,
     headChunk?: UnifiedStreamEvent
   ): ReadableStream<Uint8Array> {
@@ -447,7 +490,16 @@ export class Router {
     const iter = iterator ?? entry.adapter.sendStreaming(request);
     let finished = false;
     let headEmitted = headChunk === undefined;
-    let chunksSent = 0; // 追踪是否实际发送了内容 chunk
+    let chunksSent = 0;
+
+    // 预取 headChunk 中的 usage 数据
+    if (headChunk && headChunk.type === 'message_stop' && 'usage' in headChunk && headChunk.usage) {
+      const u = headChunk.usage as { input_tokens: number; output_tokens: number };
+      ctx.promptTokens = u.input_tokens ?? null;
+      ctx.completionTokens = u.output_tokens ?? null;
+      ctx.totalTokens = (ctx.promptTokens !== null && ctx.completionTokens !== null)
+        ? ctx.promptTokens + ctx.completionTokens : null;
+    }
 
     return new ReadableStream<Uint8Array>({
       async pull(controller) {
@@ -464,19 +516,34 @@ export class Router {
           if (done) {
             if (!finished) {
               finished = true;
+              ctx.provider = providerName;
+              ctx.latencyMs = Date.now() - ctx.startTime;
+              if (ctx.statusCode === 0) {
+                ctx.statusCode = chunksSent === 0 ? 502 : 200;
+              }
               if (chunksSent === 0) {
                 // 流未产生任何内容 chunk：视为上游异常，记录失败
                 entry.breaker.recordFailure();
-                logRequestAsync(requestId, modelId, providerName, 0, 502, 'Empty stream (no chunks)');
+                ctx.errorMsg = 'Empty stream (no chunks)';
               } else {
                 entry.breaker.recordSuccess();
-                logRequestAsync(requestId, modelId, providerName, 0, 200);
               }
+              logComplete(ctx);
             }
             controller.enqueue(encoder.encode('data: [DONE]\n\n'));
             controller.close();
             return;
           }
+
+          // 从 message_stop 事件提取 token 用量
+          if (value.type === 'message_stop' && 'usage' in value && value.usage) {
+            const u = value.usage as { input_tokens: number; output_tokens: number };
+            ctx.promptTokens = u.input_tokens ?? null;
+            ctx.completionTokens = u.output_tokens ?? null;
+            ctx.totalTokens = (ctx.promptTokens !== null && ctx.completionTokens !== null)
+              ? ctx.promptTokens + ctx.completionTokens : null;
+          }
+
           chunksSent++;
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
         } catch (err) {
@@ -485,7 +552,11 @@ export class Router {
           if (!finished) {
             finished = true;
             entry.breaker.recordFailure();
-            logRequestAsync(requestId, modelId, providerName, 0, 502, errorMsg);
+            ctx.provider = providerName;
+            ctx.statusCode = 502;
+            ctx.latencyMs = Date.now() - ctx.startTime;
+            ctx.errorMsg = errorMsg;
+            logComplete(ctx);
           }
           controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: errorMsg })}\n\n`));
           controller.enqueue(encoder.encode('data: [DONE]\n\n'));
@@ -497,7 +568,11 @@ export class Router {
           finished = true;
           const errorMsg = err instanceof Error ? err.message : String(err);
           entry.breaker.recordFailure();
-          logRequestAsync(requestId, modelId, providerName, 0, 499, errorMsg);
+          ctx.provider = providerName;
+          ctx.statusCode = 499;
+          ctx.latencyMs = Date.now() - ctx.startTime;
+          ctx.errorMsg = errorMsg;
+          logComplete(ctx);
         }
         void iter.return(undefined);
       },
@@ -586,4 +661,3 @@ export class Router {
     }));
   }
 }
-

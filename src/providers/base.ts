@@ -4,6 +4,7 @@ import type {
   UnifiedStreamEvent,
   ProviderHealth,
 } from '../types/api.js';
+import { ProviderApiError } from '../types/api.js';
 
 // ═══════════════════════════════════════════════
 // 接口定义
@@ -30,6 +31,8 @@ export interface EntryConverter {
   fromInternal(resp: UnifiedResponse): unknown;
   /** UnifiedStreamEvent 流 → 原生 SSE ReadableStream */
   transformStream(source: ReadableStream<Uint8Array>): ReadableStream<Uint8Array>;
+  /** 构建协议原生错误响应体（替代伪成功响应） */
+  toError(status: number, message: string, type?: string): unknown;
 }
 
 // ═══════════════════════════════════════════════
@@ -98,5 +101,66 @@ export async function fetchModelsGoogleFormat(
   return (data.models ?? [])
     .map(m => m.name)
     .filter((id): id is string => typeof id === 'string');
+}
+
+// ═══════════════════════════════════════════════
+// 共享工具：流式行读取 + HTTP 错误处理（所有 adapter 共用）
+// ═══════════════════════════════════════════════
+
+/**
+ * 原始流式行读取器。
+ * 从 ReadableStreamDefaultReader 解码文本并按行 yield。
+ * 所有 adapter 的 sendStreaming() 以及 parseUnifiedSSE() 共用此函数。
+ */
+export async function* readLines(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): AsyncGenerator<string> {
+  const decoder = new TextDecoder();
+  let buffer = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        if (line) yield line;
+      }
+    }
+    if (buffer) yield buffer;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/**
+ * 对 Response 的便捷包装：从 Response.body 按行读取。
+ */
+export async function* readSSELines(
+  response: Response,
+): AsyncGenerator<string> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('No response body');
+  yield* readLines(reader);
+}
+
+/**
+ * HTTP 错误处理：若 response 非 ok 则读取错误体并抛出 ProviderApiError。
+ * 所有 adapter 的 send() 和 sendStreaming() 共用此函数。
+ */
+export async function throwOnHttpError(
+  response: Response,
+  providerName: string,
+): Promise<void> {
+  if (response.ok) return;
+  const errorText = await response.text();
+  let payload: unknown;
+  try { payload = JSON.parse(errorText); } catch { /* keep raw text */ }
+  throw new ProviderApiError(
+    `${providerName} API error ${response.status}: ${errorText}`,
+    response.status,
+    payload,
+  );
 }
 

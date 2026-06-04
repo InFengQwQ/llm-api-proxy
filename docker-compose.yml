@@ -2,20 +2,19 @@ services:
   llm-api-proxy:
     container_name: llm-api-proxy
     image: llm-api-proxy:latest
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        PORT: ${PORT}
+    build: .
     ports:
       - "${PORT}:${PORT}"
     volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
+      - llm-data:/app/data
       - ./config.yaml:/app/config.yaml:ro
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:${PORT}/health || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${PORT}/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+volumes:
+  llm-data:
+    driver: local

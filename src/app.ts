@@ -1,17 +1,18 @@
 import express, { type Request, type Response, type NextFunction } from 'express';
 import { Router } from './router/index.js';
 import { getDb } from './db/index.js';
-import { type RequestLogger } from './middleware/request-logger.js';
+import { logComplete } from './db/index.js';
+import { RequestContextMiddleware } from './middleware/request-context.js';
+import type { RequestContext } from './types/log.js';
 import { entryConverters } from './providers/index.js';
-import type { UnifiedResponse } from './types/api.js';
 
-export function createApp(router: Router, requestLogger?: RequestLogger) {
+export function createApp(router: Router, requestContextMiddleware?: RequestContextMiddleware) {
   const app = express();
   app.use(express.json({ limit: '10mb' }));
 
-  // HTTP 请求文件日志中间件（在所有路由之前）
-  if (requestLogger) {
-    app.use(requestLogger.middleware());
+  // 请求上下文中间件（创建 RequestContext + body dump）
+  if (requestContextMiddleware) {
+    app.use(requestContextMiddleware.middleware());
   }
 
   // 健康检查
@@ -45,21 +46,6 @@ export function createApp(router: Router, requestLogger?: RequestLogger) {
     pump();
   }
 
-  // 构造上游错误 → 原生错误响应实体（避免客户端收到非预期的 JSON 结构）
-  function buildUpstreamError(
-    requestId: string,
-    model: string,
-    errorMessage: string,
-  ): UnifiedResponse {
-    return {
-      id: requestId,
-      model,
-      content: [{ type: 'text', text: errorMessage }],
-      stop_reason: 'stop',
-      usage: { input_tokens: 0, output_tokens: 0 },
-    };
-  }
-
   async function handleEntry(
     protocol: string,
     req: Request,
@@ -81,26 +67,48 @@ export function createApp(router: Router, requestLogger?: RequestLogger) {
         return;
       }
 
-      const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       const sessionId = req.headers['x-session-id'] as string | undefined;
 
-      // 2. 路由 + 上游调用
+      // 2. 从 res.locals.ctx 获取请求上下文（由 RequestContextMiddleware 创建）
+      const ctx = (res.locals as Record<string, unknown>).ctx as RequestContext | undefined;
+      if (ctx) {
+        ctx.entryProtocol = protocol;
+        ctx.model = ccRequest.model;
+      }
+
+      // 3. 路由 + 上游调用
       const upstreamResponse = await router.route(
-        ccRequest.model, ccRequest, requestId, sessionId,
+        ccRequest.model, ccRequest, ctx ?? {
+          requestId: `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          startTime: Date.now(),
+          method: req.method,
+          path: req.originalUrl || req.url,
+          model: ccRequest.model,
+          ip: (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.socket.remoteAddress || '-',
+          userAgent: (req.headers['user-agent'] as string) || '-',
+          entryProtocol: protocol,
+          isStream: !!ccRequest.stream,
+          provider: '-',
+          statusCode: 0,
+          latencyMs: 0,
+          promptTokens: null,
+          completionTokens: null,
+          totalTokens: null,
+          errorMsg: null,
+          errorPayload: null,
+        }, sessionId,
       );
 
-      // 3. 流式：OpenAI SSE → 原生 SSE
+      // 4. 流式：OpenAI SSE → 原生 SSE
       if (ccRequest.stream) {
         const contentType = upstreamResponse.headers.get('Content-Type') || '';
         if (!contentType.startsWith('text/event-stream')) {
           const data = await upstreamResponse.json();
           if (data.error) {
-            const nativeErr = converter.fromInternal(
-              buildUpstreamError(requestId, ccRequest.model, data.error.message),
-            );
-            res.status(upstreamResponse.status).set('X-Request-Id', requestId).json(nativeErr);
+            const nativeErr = converter.toError(upstreamResponse.status, data.error.message, data.error.type);
+            res.status(upstreamResponse.status).set('X-Request-Id', ctx?.requestId ?? '').json(nativeErr);
           } else {
-            res.status(upstreamResponse.status).set('X-Request-Id', requestId).json(data);
+            res.status(upstreamResponse.status).set('X-Request-Id', ctx?.requestId ?? '').json(data);
           }
           return;
         }
@@ -109,17 +117,15 @@ export function createApp(router: Router, requestLogger?: RequestLogger) {
         return;
       }
 
-      // 4. 非流式：ChatCompletionResponse → 原生格式
+      // 5. 非流式：ChatCompletionResponse → 原生格式
       const ccResp = await upstreamResponse.json();
       if (ccResp.error) {
-        const nativeErr = converter.fromInternal(
-          buildUpstreamError(requestId, ccRequest.model, ccResp.error.message),
-        );
-        res.status(upstreamResponse.status).set('X-Request-Id', requestId).json(nativeErr);
+        const nativeErr = converter.toError(upstreamResponse.status, ccResp.error.message, ccResp.error.type);
+        res.status(upstreamResponse.status).set('X-Request-Id', ctx?.requestId ?? '').json(nativeErr);
         return;
       }
       const nativeResp = converter.fromInternal(ccResp);
-      res.status(upstreamResponse.status).set('X-Request-Id', requestId).json(nativeResp);
+      res.status(upstreamResponse.status).set('X-Request-Id', ctx?.requestId ?? '').json(nativeResp);
     } catch (err) {
       next(err);
     }
@@ -191,12 +197,33 @@ export function createApp(router: Router, requestLogger?: RequestLogger) {
   app.get('/admin/logs', (req, res) => {
     const limit = Math.min(Number(req.query.limit) || 100, 1000);
     const provider = req.query.provider as string | undefined;
+    const protocol = req.query.protocol as string | undefined;
+    const status = req.query.status as string | undefined;
+    const method = req.query.method as string | undefined;
+
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+
+    if (provider) {
+      conditions.push('provider = ?');
+      params.push(provider);
+    }
+    if (protocol) {
+      conditions.push('entry_protocol = ?');
+      params.push(protocol);
+    }
+    if (status) {
+      conditions.push('status_code = ?');
+      params.push(Number(status));
+    }
+    if (method) {
+      conditions.push('method = ?');
+      params.push(method);
+    }
 
     let sql = 'SELECT * FROM request_logs';
-    const params: unknown[] = [];
-    if (provider) {
-      sql += ' WHERE provider = ?';
-      params.push(provider);
+    if (conditions.length > 0) {
+      sql += ' WHERE ' + conditions.join(' AND ');
     }
     sql += ' ORDER BY created_at DESC LIMIT ?';
     params.push(limit);
@@ -206,8 +233,15 @@ export function createApp(router: Router, requestLogger?: RequestLogger) {
   });
 
   // 全局错误处理
-  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
     console.error('[Error]', err);
+    const ctx = (res.locals as Record<string, unknown>).ctx as RequestContext | undefined;
+    if (ctx) {
+      ctx.statusCode = 500;
+      ctx.latencyMs = Date.now() - ctx.startTime;
+      ctx.errorMsg = err.message || 'Internal server error';
+      logComplete(ctx);
+    }
     res.status(500).json({ error: { message: err.message || 'Internal server error' } });
   });
 

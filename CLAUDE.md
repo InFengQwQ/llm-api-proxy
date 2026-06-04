@@ -67,7 +67,7 @@ src/
   config/               # YAML 加载 + Zod 校验
   db/                   # SQLite 初始化 + 请求日志（缓冲写入）
   middleware/
-    request-logger.ts   # 请求日志（文件 + 请求/响应体捕获）
+    request-context.ts # 请求上下文（requestId / 状态记录）
   providers/
     base.ts             # ProviderAdapter / EntryConverter 接口 + 共享工具
     index.ts            # adapterMap + createAdapter 工厂 + parseModelId
@@ -87,18 +87,19 @@ src/
     provider.ts         # ProviderType 枚举
 config.yaml             # 实际配置（不入 git）
 config.example.yaml     # 配置模板
-build.ps1               # Docker 构建 + 部署 + 健康检查
 ```
 
 ## 常用命令
 
+> 一个统一的 Docker 镜像，dev / prod 不区分。改代码就 `npm run up`（自动 rebuild）；强制从零走 `build.ps1`（PowerShell）。
+
 ```bash
-npm run dev        # 开发模式（tsx watch）
-npm run build      # 构建（tsc）
-npm start          # 生产运行
-npm test           # 单测（vitest）
+npm run up         # 启动容器（源码变了自动 rebuild）
+build.ps1          # 强制 down → build → up（PowerShell）
+npm run down       # 停容器
+npm run logs       # 跟随容器日志
+npm test           # 单测（vitest，主机跑）
 npm run lint       # 类型检查（tsc --noEmit）
-npm run docker     # Docker 部署（build.ps1）
 ```
 
 ## 模型命名约定

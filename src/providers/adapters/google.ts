@@ -5,7 +5,7 @@ import type {
 import { ProviderApiError } from '../../types/api.js';
 import type { ProviderConfig } from '../../config/index.js';
 import type { ProviderAdapter, EntryConverter } from '../base.js';
-import { createHealthCheck, fetchModelsGoogleFormat } from '../base.js';
+import { createHealthCheck, fetchModelsGoogleFormat, throwOnHttpError, readSSELines } from '../base.js';
 import { parseUnifiedSSE } from '../unified-utils.js';
 import type { GoogleResponse } from '../../types/api.js';
 
@@ -27,7 +27,7 @@ export class GoogleAdapter implements ProviderAdapter {
     return `${this.getBaseUrl()}/v1beta/models/${model}:${endpoint}?${key}`;
   }
 
-  private toGoogleRequest(req: UnifiedRequest): Record<string, unknown> {
+  private buildRequest(req: UnifiedRequest): Record<string, unknown> {
     const systemInstructions = req.messages
       .filter(m => m.role === 'system')
       .flatMap(m => m.content.filter(b => b.type === 'text'))
@@ -94,79 +94,94 @@ export class GoogleAdapter implements ProviderAdapter {
 
   async send(request: UnifiedRequest): Promise<UnifiedResponse> {
     const url = this.buildUrl(request.model, false);
-    const body = this.toGoogleRequest(request);
+    const body = this.buildRequest(request);
     const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      let payload; try { payload = JSON.parse(errText); } catch { /* ignore */ }
-      throw new ProviderApiError(`Google API error ${response.status}: ${errText}`, response.status, payload);
-    }
+    await throwOnHttpError(response, this.name);
 
     const data = await response.json() as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string; functionCall?: { name: string; args: Record<string, unknown> } }> }; finishReason?: string }>;
+      candidates?: Array<{
+        content?: {
+          parts?: Array<{
+            text?: string;
+            thought?: boolean;
+            thinking?: string;
+            functionCall?: { name: string; args: Record<string, unknown> };
+          }>;
+          role?: string;
+        };
+        finishReason?: string;
+      }>;
       usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number };
     };
 
     const parts = data.candidates?.[0]?.content?.parts ?? [];
     const content: UnifiedContentBlock[] = [];
     for (const p of parts) {
-      if (p.text) content.push({ type: 'text', text: p.text });
+      if (p.thought) {
+        content.push({ type: 'thinking', thinking: p.text ?? p.thinking ?? '' });
+      } else if (p.text !== undefined) {
+        content.push({ type: 'text', text: p.text });
+      }
       if (p.functionCall) content.push({ type: 'tool_use', id: `call_${Date.now()}`, name: p.functionCall.name, input: p.functionCall.args ?? {} });
     }
 
+    const finishReason = data.candidates?.[0]?.finishReason;
+    const stopReason = finishReason === 'MAX_TOKENS' ? 'max_tokens'
+      : finishReason === 'STOP' ? 'stop'
+      : content.some(b => b.type === 'tool_use') ? 'tool_use'
+      : 'stop';
+
     return {
       id: `google-${Date.now()}`, model: request.model, content,
-      stop_reason: content.some(b => b.type === 'tool_use') ? 'tool_use' : 'stop',
+      stop_reason: stopReason,
       usage: { input_tokens: data.usageMetadata?.promptTokenCount ?? 0, output_tokens: data.usageMetadata?.candidatesTokenCount ?? 0 },
     };
   }
 
   async *sendStreaming(request: UnifiedRequest): AsyncGenerator<UnifiedStreamEvent> {
     const url = this.buildUrl(request.model, true);
-    const body = this.toGoogleRequest(request);
+    const body = this.buildRequest(request);
     const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      let payload; try { payload = JSON.parse(errText); } catch { /* ignore */ }
-      throw new ProviderApiError(`Google API error ${response.status}: ${errText}`, response.status, payload);
-    }
+    await throwOnHttpError(response, this.name);
 
-    const reader = response.body?.getReader();
-    if (!reader) throw new Error('No response body');
-    const decoder = new TextDecoder();
     const msgId = `google-${Date.now()}`;
     let started = false;
+    const activeFnIndices = new Set<number>();
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const lines = decoder.decode(value, { stream: true }).split('\n').filter(Boolean);
-      for (const line of lines) {
-        try {
-          const data = JSON.parse(line);
-          const parts: Array<{ text?: string; functionCall?: { name: string; args: Record<string, unknown> } }> = data.candidates?.[0]?.content?.parts ?? [];
+    for await (const line of readSSELines(response)) {
+      try {
+        const data = JSON.parse(line);
+        const parts: Array<{ text?: string; thought?: boolean; thinking?: string; functionCall?: { name: string; args: Record<string, unknown> } }> = data.candidates?.[0]?.content?.parts ?? [];
 
-          for (const [idx, part] of parts.entries()) {
-            if (part.text !== undefined) {
-              if (!started) { yield { type: 'message_start', id: msgId, model: request.model }; started = true; }
-              yield { type: 'text_delta', text: part.text, index: idx };
-            }
-            if (part.functionCall) {
-              if (!started) { yield { type: 'message_start', id: msgId, model: request.model }; started = true; }
-              yield { type: 'tool_use_start', id: `call_${Date.now()}_${idx}`, name: part.functionCall.name, index: idx };
-              yield { type: 'tool_use_delta', id: `call_${Date.now()}_${idx}`, partial_json: JSON.stringify(part.functionCall.args ?? {}), index: idx };
-            }
+        for (const [idx, part] of parts.entries()) {
+          if (part.thought) {
+            if (!started) { yield { type: 'message_start', id: msgId, model: request.model }; started = true; }
+            yield { type: 'thinking_delta', thinking: part.text ?? part.thinking ?? '', index: idx };
+          } else if (part.text !== undefined) {
+            if (!started) { yield { type: 'message_start', id: msgId, model: request.model }; started = true; }
+            yield { type: 'text_delta', text: part.text, index: idx };
           }
-
-          if (data.candidates?.[0]?.finishReason) {
-            const hasFC = parts.some(p => p.functionCall);
-            yield { type: 'message_stop', stop_reason: hasFC ? 'tool_use' : 'stop' };
+          if (part.functionCall) {
+            if (!started) { yield { type: 'message_start', id: msgId, model: request.model }; started = true; }
+            activeFnIndices.add(idx);
+            const toolCallId = `call_${Date.now()}_${idx}`;
+            yield { type: 'tool_use_start', id: toolCallId, name: part.functionCall.name, index: idx };
+            yield { type: 'tool_use_delta', id: toolCallId, partial_json: JSON.stringify(part.functionCall.args ?? {}), index: idx };
           }
-        } catch (e) {
-          throw new ProviderApiError(`Failed to parse Google SSE line: ${line}`, 500, { error: e });
         }
+
+        if (data.candidates?.[0]?.finishReason) {
+          for (const index of activeFnIndices) {
+            yield { type: 'content_block_stop', index };
+          }
+          activeFnIndices.clear();
+          const hasFC = parts.some(p => p.functionCall);
+          yield { type: 'message_stop', stop_reason: hasFC ? 'tool_use' : 'stop' };
+        }
+      } catch (e) {
+        throw new ProviderApiError(`Failed to parse Google SSE line: ${line}`, 500, { error: e });
       }
     }
   }
@@ -197,20 +212,33 @@ export function createGoogleEntryConverter(): EntryConverter {
 
       const contents = (body.contents ?? []) as Array<{
         role: 'user' | 'model';
-        parts: Array<{ text?: string; functionCall?: { name: string; args: Record<string, unknown> }; functionResponse?: { name: string; response: Record<string, unknown> } }>;
+        parts: Array<{ text?: string; thought?: boolean; thinking?: string; functionCall?: { name: string; args: Record<string, unknown> }; functionResponse?: { name: string; response: Record<string, unknown> } }>;
       }>;
+
+      // 追踪同名 functionCall 的 ID 队列，用于 functionResponse 的 tool_call_id
+      const toolCallIdQueues = new Map<string, string[]>();
 
       for (const c of contents) {
         for (const part of c.parts) {
           if (part.functionCall) {
-            msgs.push({ role: 'assistant', content: [{ type: 'tool_use', id: `call_${Date.now()}`, name: part.functionCall.name, input: part.functionCall.args ?? {} }] });
+            const id = `call_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+            const queue = toolCallIdQueues.get(part.functionCall.name) ?? [];
+            queue.push(id);
+            toolCallIdQueues.set(part.functionCall.name, queue);
+            msgs.push({ role: 'assistant', content: [{ type: 'tool_use', id, name: part.functionCall.name, input: part.functionCall.args ?? {} }] });
           } else if (part.functionResponse) {
             const resultStr = typeof part.functionResponse.response === 'string'
               ? part.functionResponse.response
               : JSON.stringify(part.functionResponse.response?.content ?? part.functionResponse.response ?? '');
-            msgs.push({ role: 'tool', content: [{ type: 'text', text: resultStr }], name: part.functionResponse.name });
+            const queue = toolCallIdQueues.get(part.functionResponse.name) ?? [];
+            const toolCallId = queue.shift();
+            msgs.push({ role: 'tool', content: [{ type: 'text', text: resultStr }], name: part.functionResponse.name, tool_call_id: toolCallId });
           } else if (part.text !== undefined) {
-            msgs.push({ role: c.role === 'model' ? 'assistant' : 'user', content: [{ type: 'text', text: part.text }] });
+            const role = c.role === 'model' ? 'assistant' : 'user';
+            const isThinking = part.thought === true;
+            msgs.push({ role, content: [isThinking
+              ? { type: 'thinking' as const, thinking: part.text }
+              : { type: 'text' as const, text: part.text }] });
           }
         }
       }
@@ -244,16 +272,21 @@ export function createGoogleEntryConverter(): EntryConverter {
     },
 
     fromInternal(resp: UnifiedResponse): GoogleResponse {
-      const parts: Array<{ text?: string; functionCall?: { name: string; args: Record<string, unknown> } }> = [];
+      const parts: Array<{ text?: string; thought?: boolean; functionCall?: { name: string; args: Record<string, unknown> } }> = [];
       for (const b of resp.content) {
         if (b.type === 'text') parts.push({ text: b.text });
+        else if (b.type === 'thinking') parts.push({ text: b.thinking, thought: true });
         else if (b.type === 'tool_use') parts.push({ functionCall: { name: b.name, args: b.input } });
       }
-      const googleFinish = resp.stop_reason === 'tool_use' ? 'STOP' : 'STOP';
+      const googleFinish = resp.stop_reason === 'max_tokens' ? 'MAX_TOKENS' : 'STOP';
       return {
         candidates: [{ content: { parts, role: 'model' }, finishReason: googleFinish }],
         usageMetadata: { promptTokenCount: resp.usage.input_tokens, candidatesTokenCount: resp.usage.output_tokens, totalTokenCount: resp.usage.input_tokens + resp.usage.output_tokens },
       };
+    },
+
+    toError(status: number, message: string, _type?: string): unknown {
+      return { error: { code: status, message, status: 'INTERNAL' } };
     },
 
     transformStream(source: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
@@ -268,6 +301,12 @@ export function createGoogleEntryConverter(): EntryConverter {
                 case 'text_delta':
                   controller.enqueue(encoder.encode(
                     `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: event.text }], role: 'model' } }] })}\n\n`
+                  ));
+                  break;
+
+                case 'thinking_delta':
+                  controller.enqueue(encoder.encode(
+                    `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: event.thinking, thought: true }], role: 'model' } }] })}\n\n`
                   ));
                   break;
 
@@ -296,8 +335,9 @@ export function createGoogleEntryConverter(): EntryConverter {
 
                 case 'message_stop': {
                   finished = true;
+                  const finishReason = event.stop_reason === 'max_tokens' ? 'MAX_TOKENS' : 'STOP';
                   const resp: Record<string, unknown> = {
-                    candidates: [{ content: { parts: [], role: 'model' }, finishReason: 'STOP' }],
+                    candidates: [{ content: { parts: [], role: 'model' }, finishReason }],
                   };
                   if (event.usage) {
                     resp.usageMetadata = {

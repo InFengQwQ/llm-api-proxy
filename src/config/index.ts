@@ -59,6 +59,8 @@ const ProviderSchema = z.object({
   enabled: z.boolean().default(true),
   circuit_breaker: CircuitBreakerSchema.default({}),
   rate_limit: RateLimitSchema.optional(),
+  /** 非标准提供商兼容：在 Anthropic 请求中额外发送 output_tokens 字段（默认 false） */
+  compat_output_tokens: z.boolean().default(false),
 }).strict();
 
 const AutoRoutingGroupSchema = z.object({

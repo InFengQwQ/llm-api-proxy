@@ -8,7 +8,6 @@
 
 export type UnifiedContentBlock =
   | UnifiedTextBlock
-  | UnifiedImageBlock
   | UnifiedToolUseBlock
   | UnifiedToolResultBlock
   | UnifiedThinkingBlock;
@@ -16,11 +15,6 @@ export type UnifiedContentBlock =
 export interface UnifiedTextBlock {
   type: 'text';
   text: string;
-}
-
-export interface UnifiedImageBlock {
-  type: 'image';
-  source: { data: string; media_type: string };
 }
 
 export interface UnifiedToolUseBlock {
@@ -80,8 +74,8 @@ export interface UnifiedRequest {
   stop_sequences?: string[];
   tools?: UnifiedTool[];
   tool_choice?: UnifiedToolChoice;
-  /** 协议特有参数透传 */
-  provider_options?: Record<string, unknown>;
+  /** 扩展思考/推理（Anthropic / OpenAI reasoning）。开启时传入 budget_tokens */
+  extended_thinking?: { budget_tokens: number };
 }
 
 // ── Response ──
@@ -90,7 +84,7 @@ export interface UnifiedResponse {
   id: string;
   model: string;
   content: UnifiedContentBlock[];
-  stop_reason: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' | 'stop';
+  stop_reason: 'max_tokens' | 'stop_sequence' | 'tool_use' | 'stop';
   usage: { input_tokens: number; output_tokens: number };
 }
 
@@ -113,7 +107,7 @@ export type UnifiedStreamEvent =
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string | null;
+  content: string | null | Array<{ type: string; text?: string; image_url?: { url: string } }>;
   name?: string;
   tool_call_id?: string;
   tool_calls?: ToolCall[];
@@ -186,11 +180,12 @@ export interface AnthropicMessageResponse {
   type: 'message';
   role: 'assistant';
   content: Array<{
-    type: 'text' | 'tool_use';
+    type: 'text' | 'tool_use' | 'thinking';
     text?: string;
     id?: string;
     name?: string;
     input?: Record<string, unknown>;
+    thinking?: string;
   }>;
   model: string;
   stop_reason: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use';
@@ -205,7 +200,15 @@ export interface AnthropicMessageResponse {
 
 export interface GoogleResponse {
   candidates?: Array<{
-    content?: { parts?: Array<{ text?: string }>; role?: string };
+    content?: {
+      parts?: Array<{
+        text?: string;
+        thought?: boolean;
+        thinking?: string;
+        functionCall?: { name: string; args: Record<string, unknown> };
+      }>;
+      role?: string;
+    };
     finishReason?: string;
   }>;
   usageMetadata?: {

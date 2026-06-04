@@ -2,16 +2,14 @@
   "name": "llm-api-proxy",
   "version": "1.0.0",
   "description": "统一 LLM API 代理网关，支持多 Provider 自动路由与故障切换",
-  "main": "dist/index.js",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "build": "tsc",
-    "start": "node dist/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
-    "docker": "powershell -File build.ps1"
+    "up": "docker compose up -d --build",
+    "down": "docker compose down",
+    "logs": "docker compose logs -f"
   },
   "dependencies": {
     "express": "^4.21.2",

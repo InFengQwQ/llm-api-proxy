@@ -13,6 +13,8 @@ import type { ProviderAdapter, EntryConverter } from '../base.js';
 import {
   createHealthCheck,
   fetchModelsOpenAIFormat,
+  throwOnHttpError,
+  readSSELines,
 } from '../base.js';
 import { createAccumulator, parseUnifiedSSE } from '../unified-utils.js';
 
@@ -37,7 +39,7 @@ export class AnthropicAdapter implements ProviderAdapter {
   }
 
   // Unified �?Anthropic request
-  private toAnthropicRequest(req: UnifiedRequest): Record<string, unknown> {
+  private buildRequest(req: UnifiedRequest): Record<string, unknown> {
     const systemBlocks = req.messages
       .filter(m => m.role === 'system')
       .flatMap(m => m.content.filter(b => b.type === 'text'))
@@ -88,9 +90,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       model: req.model,
       messages,
       max_tokens: maxTokens,
-      // Include both field names for compatibility with non-standard providers
-      // (some Chinese AI services expect "output_tokens" instead of "max_tokens")
-      ...(req.provider_options?.compat_output_tokens !== false ? { output_tokens: maxTokens } : {}),
+      ...(this.config.compat_output_tokens ? { output_tokens: maxTokens } : {}),
       stream: false,
     };
 
@@ -119,14 +119,15 @@ export class AnthropicAdapter implements ProviderAdapter {
       }
     }
 
-    const thinking = req.provider_options?.thinking as Record<string, unknown> | undefined;
-    if (thinking) body.thinking = thinking;
+    if (req.extended_thinking) {
+      body.thinking = { type: 'enabled', budget_tokens: req.extended_thinking.budget_tokens };
+    }
 
     return body;
   }
 
   // Anthropic response �?UnifiedResponse
-  private toUnifiedResponse(resp: AnthropicMessageResponse, model: string): UnifiedResponse {
+  private parseResponse(resp: AnthropicMessageResponse, model: string): UnifiedResponse {
     const content: UnifiedContentBlock[] = [];
 
     for (const block of resp.content) {
@@ -139,6 +140,8 @@ export class AnthropicAdapter implements ProviderAdapter {
           name: block.name ?? '',
           input: block.input ?? {},
         });
+      } else if (block.type === 'thinking') {
+        content.push({ type: 'thinking', thinking: block.thinking ?? '' });
       }
     }
 
@@ -146,7 +149,10 @@ export class AnthropicAdapter implements ProviderAdapter {
       id: resp.id,
       model,
       content,
-      stop_reason: resp.stop_reason === 'tool_use' ? 'tool_use' : 'stop',
+      stop_reason: resp.stop_reason === 'tool_use' ? 'tool_use'
+        : resp.stop_reason === 'max_tokens' ? 'max_tokens'
+        : resp.stop_reason === 'stop_sequence' ? 'stop_sequence'
+        : 'stop',
       usage: {
         input_tokens: resp.usage?.input_tokens ?? 0,
         output_tokens: resp.usage?.output_tokens ?? 0,
@@ -155,7 +161,7 @@ export class AnthropicAdapter implements ProviderAdapter {
   }
 
   async send(request: UnifiedRequest): Promise<UnifiedResponse> {
-    const body = this.toAnthropicRequest(request);
+    const body = this.buildRequest(request);
 
     const response = await fetch(`${this.getBaseUrl()}/v1/messages`, {
       method: 'POST',
@@ -163,19 +169,14 @@ export class AnthropicAdapter implements ProviderAdapter {
       body: JSON.stringify(body),
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      let payload;
-      try { payload = JSON.parse(errorText); } catch { /* ignore */ }
-      throw new ProviderApiError(`Anthropic API error ${response.status}: ${errorText}`, response.status, payload);
-    }
+    await throwOnHttpError(response, this.name);
 
     const resp = await response.json() as AnthropicMessageResponse;
-    return this.toUnifiedResponse(resp, request.model);
+    return this.parseResponse(resp, request.model);
   }
 
   async *sendStreaming(request: UnifiedRequest): AsyncGenerator<UnifiedStreamEvent> {
-    const body = this.toAnthropicRequest(request);
+    const body = this.buildRequest(request);
     body.stream = true;
 
     const response = await fetch(`${this.getBaseUrl()}/v1/messages`, {
@@ -184,18 +185,8 @@ export class AnthropicAdapter implements ProviderAdapter {
       body: JSON.stringify(body),
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      let payload;
-      try { payload = JSON.parse(errorText); } catch { /* ignore */ }
-      throw new ProviderApiError(`Anthropic API error ${response.status}: ${errorText}`, response.status, payload);
-    }
+    await throwOnHttpError(response, this.name);
 
-    const reader = response.body?.getReader();
-    if (!reader) throw new Error('No response body');
-
-    const decoder = new TextDecoder();
-    let buffer = '';
     const msgId = `msg_${Math.random().toString(36).slice(2, 11)}`;
     let started = false;
     const activeToolIndexes = new Map<number, { id: string; name: string }>();
@@ -203,54 +194,45 @@ export class AnthropicAdapter implements ProviderAdapter {
     let outputTokens = 0;
     let stopReason = 'end_turn';
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    for await (const line of readSSELines(response)) {
+      if (!line.startsWith('data: ')) continue;
+      const data = line.slice(6).trim();
+      if (data === '[DONE]') break;
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
+      try {
+        const event = JSON.parse(data);
 
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6).trim();
-        if (data === '[DONE]') break;
-
-        try {
-          const event = JSON.parse(data);
-
-          if (event.type === 'message_start') {
-            if (!started) {
-              yield { type: 'message_start', id: msgId, model: request.model };
-              started = true;
-            }
-            inputTokens = event.message?.usage?.input_tokens ?? 0;
-          } else if (event.type === 'content_block_start') {
-            const block = event.content_block;
-            if (block?.type === 'tool_use') {
-              activeToolIndexes.set(event.index, { id: block.id ?? '', name: block.name ?? '' });
-              yield { type: 'tool_use_start', id: block.id ?? '', name: block.name ?? '', index: event.index };
-            }
-          } else if (event.type === 'content_block_delta') {
-            if (event.delta.type === 'text_delta') {
-              yield { type: 'text_delta', text: event.delta.text, index: event.index };
-            } else if (event.delta.type === 'input_json_delta') {
-              const info = activeToolIndexes.get(event.index);
-              yield { type: 'tool_use_delta', id: info?.id ?? '', partial_json: event.delta.partial_json, index: event.index };
-            } else if (event.delta.type === 'thinking_delta') {
-              yield { type: 'thinking_delta', thinking: event.delta.thinking, index: event.index };
-            }
-          } else if (event.type === 'content_block_stop') {
-            yield { type: 'content_block_stop', index: event.index };
-          } else if (event.type === 'message_delta') {
-            outputTokens = event.usage?.output_tokens ?? 0;
-            if (event.delta?.stop_reason) stopReason = event.delta.stop_reason;
-          } else if (event.type === 'message_stop') {
-            // Anthropic sends message_stop at end
+        if (event.type === 'message_start') {
+          if (!started) {
+            yield { type: 'message_start', id: msgId, model: request.model };
+            started = true;
           }
-        } catch (e) {
-          throw new ProviderApiError(`Failed to parse Anthropic SSE chunk: ${data}`, 500, { error: e });
+          inputTokens = event.message?.usage?.input_tokens ?? 0;
+        } else if (event.type === 'content_block_start') {
+          const block = event.content_block;
+          if (block?.type === 'tool_use') {
+            activeToolIndexes.set(event.index, { id: block.id ?? '', name: block.name ?? '' });
+            yield { type: 'tool_use_start', id: block.id ?? '', name: block.name ?? '', index: event.index };
+          }
+        } else if (event.type === 'content_block_delta') {
+          if (event.delta.type === 'text_delta') {
+            yield { type: 'text_delta', text: event.delta.text, index: event.index };
+          } else if (event.delta.type === 'input_json_delta') {
+            const info = activeToolIndexes.get(event.index);
+            yield { type: 'tool_use_delta', id: info?.id ?? '', partial_json: event.delta.partial_json, index: event.index };
+          } else if (event.delta.type === 'thinking_delta') {
+            yield { type: 'thinking_delta', thinking: event.delta.thinking, index: event.index };
+          }
+        } else if (event.type === 'content_block_stop') {
+          yield { type: 'content_block_stop', index: event.index };
+        } else if (event.type === 'message_delta') {
+          outputTokens = event.usage?.output_tokens ?? 0;
+          if (event.delta?.stop_reason) stopReason = event.delta.stop_reason;
+        } else if (event.type === 'message_stop') {
+          // Anthropic sends message_stop at end
         }
+      } catch (e) {
+        throw new ProviderApiError(`Failed to parse Anthropic SSE chunk: ${data}`, 500, { error: e });
       }
     }
 
@@ -312,6 +294,8 @@ export function createAnthropicEntryConverter(): EntryConverter {
         if (sysText) msgs.push({ role: 'system', content: [{ type: 'text', text: sysText }] });
       }
 
+      const toolUseNames = new Map<string, string>();
+
       for (const m of req.messages) {
         if (typeof m.content === 'string') {
           msgs.push({ role: m.role, content: [{ type: 'text', text: m.content }] });
@@ -324,8 +308,11 @@ export function createAnthropicEntryConverter(): EntryConverter {
               const text = typeof orig.content === 'string'
                 ? orig.content
                 : Array.isArray(orig.content) ? orig.content.map(c => c.text ?? '').join('') : '';
-              msgs.push({ role: 'tool', content: [{ type: 'text', text }], tool_call_id: orig.tool_use_id });
+              const name = toolUseNames.get(orig.tool_use_id);
+              msgs.push({ role: 'tool', content: [{ type: 'text', text }], tool_call_id: orig.tool_use_id, name });
             } else {
+              // Track tool_use name for later tool result pairing
+              if (orig.type === 'tool_use') toolUseNames.set(orig.id ?? '', orig.name ?? '');
               // Convert non-tool_result blocks via helper
               const [unified] = contentToUnifiedBlocks([orig]);
               mainBlocks.push(unified);
@@ -350,13 +337,14 @@ export function createAnthropicEntryConverter(): EntryConverter {
           toolChoice = { type: 'tool', name: req.tool_choice.name ?? '' };
         else if (req.tool_choice.type === 'auto') toolChoice = 'auto';
         else if (req.tool_choice.type === 'any') toolChoice = 'any';
+        else if (req.tool_choice.type === 'none') toolChoice = 'none';
       }
 
       return {
         model: req.model, messages: msgs, max_tokens: req.max_tokens ?? 8192,
         temperature: req.temperature, top_p: req.top_p, stop_sequences: req.stop_sequences,
         stream: req.stream, tools, tool_choice: toolChoice,
-        provider_options: { thinking: req.thinking },
+        extended_thinking: req.thinking ? { budget_tokens: req.thinking.budget_tokens } : undefined,
       };
     },
 
@@ -365,10 +353,13 @@ export function createAnthropicEntryConverter(): EntryConverter {
       for (const b of resp.content) {
         if (b.type === 'text') content.push({ type: 'text', text: b.text });
         else if (b.type === 'tool_use') content.push({ type: 'tool_use', id: b.id, name: b.name, input: b.input });
+        else if (b.type === 'thinking') content.push({ type: 'thinking', thinking: b.thinking });
       }
 
       const stopReason = resp.stop_reason === 'tool_use' ? 'tool_use' : (
-        resp.stop_reason === 'max_tokens' ? 'max_tokens' : 'end_turn'
+        resp.stop_reason === 'max_tokens' ? 'max_tokens' : (
+          resp.stop_reason === 'stop_sequence' ? 'stop_sequence' : 'end_turn'
+        )
       );
 
       return {
@@ -376,6 +367,10 @@ export function createAnthropicEntryConverter(): EntryConverter {
         stop_reason: stopReason, stop_sequence: null,
         usage: { input_tokens: resp.usage.input_tokens, output_tokens: resp.usage.output_tokens },
       };
+    },
+
+    toError(_status: number, message: string, type?: string): unknown {
+      return { type: 'error', error: { type: type ?? 'api_error', message } };
     },
 
     transformStream(source: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {

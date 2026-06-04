@@ -1,10 +1,9 @@
-node_modules
-dist
-data
-.env
+node_modules/
+data/
+test/
 *.log
+.env
 .git
-test
 *.md
 config.example.yaml
 config.yaml

@@ -11,6 +11,7 @@ import type {
   ToolCall,
   ChatMessage,
 } from '../types/api.js';
+import { readLines } from './base.js';
 
 // ═══════════════════════════════════════════════
 // SSE 流解析：从 Router 输出的 UnifiedStreamEvent SSE → 事件迭代器
@@ -24,28 +25,14 @@ import type {
 export async function* parseUnifiedSSE(
   source: ReadableStream<Uint8Array>,
 ): AsyncGenerator<UnifiedStreamEvent> {
-  const reader = source.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('data: ')) continue;
-        const data = trimmed.slice(6).trim();
-        if (data === '[DONE]') continue;
-        try {
-          yield JSON.parse(data) as UnifiedStreamEvent;
-        } catch { /* skip malformed chunks */ }
-      }
-    }
-  } finally {
-    reader.releaseLock();
+  for await (const line of readLines(source.getReader())) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data: ')) continue;
+    const data = trimmed.slice(6).trim();
+    if (data === '[DONE]') continue;
+    try {
+      yield JSON.parse(data) as UnifiedStreamEvent;
+    } catch { /* skip malformed chunks */ }
   }
 }
 
@@ -102,7 +89,17 @@ export function chatMessagesToUnified(msgs: ChatMessage[]): UnifiedMessage[] {
     const blocks: UnifiedContentBlock[] = [];
 
     if (m.content) {
-      blocks.push({ type: 'text', text: m.content });
+      if (typeof m.content === 'string') {
+        blocks.push({ type: 'text', text: m.content });
+      } else {
+        // Array of content parts (multimodal): extract text parts
+        for (const part of m.content) {
+          if (part.type === 'text' && part.text) {
+            blocks.push({ type: 'text', text: part.text });
+          }
+          // image_url parts are silently dropped — they don't map to Unified IR
+        }
+      }
     }
 
     if (m.tool_calls) {
@@ -123,6 +120,19 @@ export function chatMessagesToUnified(msgs: ChatMessage[]): UnifiedMessage[] {
 }
 
 export function unifiedToChatMessages(msgs: UnifiedMessage[]): ChatMessage[] {
+  // Build a tool_call_id → name map from tool_use blocks so we can fill in
+  // missing `name` on tool-role messages — required by OpenAI-compatible APIs.
+  const toolNameMap = new Map<string, string>();
+  for (const m of msgs) {
+    for (const b of m.content) {
+      if (b.type === 'tool_use') {
+        const id = (b as { type: 'tool_use'; id: string; name: string }).id;
+        const name = (b as { type: 'tool_use'; id: string; name: string }).name;
+        if (id && name) toolNameMap.set(id, name);
+      }
+    }
+  }
+
   return msgs.map(m => {
     const texts = m.content.filter((b): b is { type: 'text'; text: string } => b.type === 'text');
     const toolUses = m.content.filter((b): b is { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> } => b.type === 'tool_use');
@@ -135,10 +145,16 @@ export function unifiedToChatMessages(msgs: UnifiedMessage[]): ChatMessage[] {
         }))
       : undefined;
 
+    // Resolve name for tool-role messages: prefer explicit name, then look up via tool_call_id
+    let name = m.name;
+    if (m.role === 'tool' && !name && m.tool_call_id) {
+      name = toolNameMap.get(m.tool_call_id);
+    }
+
     return {
       role: m.role,
       content: texts.map(t => t.text).join('') || null,
-      name: m.name,
+      name,
       tool_call_id: m.tool_call_id,
       ...(toolCalls ? { tool_calls: toolCalls } : {}),
     };
@@ -166,33 +182,9 @@ export function blocksToText(blocks: UnifiedContentBlock[]): string {
     .join('');
 }
 
-// ═══════════════════════════════════════════════
-// UnifiedStreamEvent 生成器（流式辅助）
-// ═══════════════════════════════════════════════
-
-/** Collect all UnifiedStreamEvents from a generator into a UnifiedResponse */
-export async function collectStreamResponse(
-  source: AsyncGenerator<UnifiedStreamEvent>,
-  id: string,
-  model: string,
-): Promise<UnifiedResponse> {
-  const acc = createAccumulator();
-  let stopReason: UnifiedResponse['stop_reason'] = 'stop';
-  let usage = { input_tokens: 0, output_tokens: 0 };
-
-  for await (const event of source) {
-    applyEvent(acc, event);
-    if (event.type === 'message_stop') {
-      stopReason = event.stop_reason as UnifiedResponse['stop_reason'];
-      if (event.usage) usage = event.usage;
-    }
-  }
-
-  return {
-    id,
-    model,
-    content: accumulatorToContent(acc),
-    stop_reason: stopReason,
-    usage,
-  };
+export function blocksToThinking(blocks: UnifiedContentBlock[]): string {
+  return blocks
+    .filter((b): b is { type: 'thinking'; thinking: string } => b.type === 'thinking')
+    .map(b => b.thinking)
+    .join('');
 }
