@@ -69,7 +69,10 @@ export class OllamaAdapter implements ProviderAdapter {
       })),
       options: { temperature: request.temperature, top_p: request.top_p, num_predict: request.max_tokens },
     };
-    if (request.tools?.length) body.tools = request.tools;
+    if (request.tools?.length) body.tools = request.tools.map(t => ({
+      type: 'function',
+      function: { name: t.name, description: t.description, parameters: t.parameters },
+    }));
     if (request.tool_choice !== undefined) body.tool_choice = request.tool_choice;
     return body;
   }
@@ -167,7 +170,7 @@ export function createOllamaEntryConverter(): EntryConverter {
 
     toInternal(body: Record<string, unknown>): UnifiedRequest {
       const options = (body.options ?? {}) as Record<string, unknown>;
-      const rawMsgs = (body.messages ?? []) as Array<{ role: string; content: string; name?: string; tool_call_id?: string; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> }>;
+      const rawMsgs = (body.messages ?? []) as Array<{ role: string; content: string; name?: string; tool_call_id?: string; tool_calls?: Array<{ id: string | null; function: { name: string; arguments: string | Record<string, unknown>; index?: number | null } }> }>;
 
       // Build a lookup map from ALL messages — tool_use IDs → tool names,
       // so tool role messages from any turn can find their name.
@@ -175,7 +178,7 @@ export function createOllamaEntryConverter(): EntryConverter {
       for (const m of rawMsgs) {
         if (m.tool_calls) {
           for (const tc of m.tool_calls) {
-            toolNameMap.set(tc.id, tc.function.name);
+            if (tc.id) toolNameMap.set(tc.id, tc.function.name);
           }
         }
       }
@@ -185,8 +188,14 @@ export function createOllamaEntryConverter(): EntryConverter {
         if (m.content) blocks.push({ type: 'text', text: m.content });
         if (m.tool_calls) {
           for (const tc of m.tool_calls) {
+            if (!tc.id) continue;
             let input: Record<string, unknown> = {};
-            try { input = JSON.parse(tc.function.arguments || '{}'); } catch { /* ignore */ }
+            const args = tc.function.arguments;
+            if (typeof args === 'string') {
+              try { input = JSON.parse(args || '{}'); } catch { /* ignore */ }
+            } else if (args && typeof args === 'object') {
+              input = args as Record<string, unknown>;
+            }
             blocks.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
           }
         }
@@ -198,7 +207,6 @@ export function createOllamaEntryConverter(): EntryConverter {
             toolCallId = m.tool_call_id;
             if (!name) name = toolNameMap.get(m.tool_call_id);
           } else if (!name && toolNameMap.size > 0) {
-            // Fallback: find the first unmatched tool_use name
             for (const [id, toolName] of toolNameMap) {
               name = toolName;
               toolCallId = id;
@@ -217,9 +225,18 @@ export function createOllamaEntryConverter(): EntryConverter {
         top_p: options.top_p as number | undefined,
         max_tokens: options.num_predict as number | undefined,
         stream: body.stream as boolean | undefined,
-        stop_sequences: options.stop as string[] | undefined,
-        tools: body.tools as UnifiedRequest['tools'],
-        tool_choice: body.tool_choice as UnifiedRequest['tool_choice'],
+        stop_sequences: (options.stop ?? undefined) as string[] | undefined,
+        tools: Array.isArray(body.tools)
+          ? (body.tools as Array<Record<string, unknown>>).map((t: Record<string, unknown>) => {
+              const fn = (t.function ?? t) as Record<string, unknown>;
+              return {
+                name: fn.name as string,
+                description: fn.description as string | undefined,
+                parameters: fn.parameters as Record<string, unknown> | undefined,
+              };
+            })
+          : undefined,
+        tool_choice: (body.tool_choice ?? undefined) as UnifiedRequest['tool_choice'],
       };
     },
 
